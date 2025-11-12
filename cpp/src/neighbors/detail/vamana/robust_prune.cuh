@@ -88,7 +88,7 @@ __global__ void RobustPruneKernel(
   static __shared__ Point<T, accT> s_query;
   s_query.coords = &s_coords_mem[blockIdx.x * (dim + align_padding)];
   s_query.Dim    = dim;
-  static __shared__ int prev_edges;
+  [[maybe_unused]] static __shared__ int prev_edges;
   static __shared__ accT graphDist;
 
   for (int i = blockIdx.x; i < num_queries; i += gridDim.x) {
