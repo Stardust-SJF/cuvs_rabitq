@@ -204,6 +204,8 @@ if(BUILD_CAGRA_HNSWLIB)
   include(cmake/thirdparty/get_hnswlib.cmake)
 endif()
 
+include(cmake/thirdparty/get_eigen.cmake)
+
 # ##################################################################################################
 # * cuvs ---------------------------------------------------------------------
 if(NOT BUILD_CPU_ONLY)
@@ -222,8 +224,6 @@ if(NOT BUILD_CPU_ONLY)
     src/neighbors/ivf_rabitq/gpu_index/quantizer_gpu_fast.cu
   )
 
-  set_target_properties(ivf_rabitq_lib PROPERTIES CUDA_SEPARABLE_COMPILATION ON)
-
   target_link_libraries(
     ivf_rabitq_lib
     PRIVATE OpenMP::OpenMP_CXX
@@ -235,7 +235,8 @@ if(NOT BUILD_CPU_ONLY)
   ) # fix rmm dependencies
 
   target_include_directories(
-    ivf_rabitq_lib PRIVATE "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
+    ivf_rabitq_lib PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>" 
+    ${Eigen3_SOURCE_DIR}
   )
 
   target_compile_options(
@@ -594,6 +595,7 @@ if(NOT BUILD_CPU_ONLY)
     cuvs_objs
     PUBLIC "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/include>"
            "$<BUILD_INTERFACE:${CMAKE_CURRENT_SOURCE_DIR}/../c/include>"
+           ${Eigen3_SOURCE_DIR}
     INTERFACE "$<INSTALL_INTERFACE:include>"
   )
 
@@ -671,8 +673,7 @@ if(NOT BUILD_CPU_ONLY)
              $<BUILD_LOCAL_INTERFACE:$<TARGET_NAME_IF_EXISTS:hnswlib::hnswlib>>
              $<$<BOOL:${CUVS_NVTX}>:CUDA::nvtx3>
       PRIVATE nvidia::cutlass::cutlass $<TARGET_NAME_IF_EXISTS:OpenMP::OpenMP_CXX>
-              cuvs-cagra-search
-              ivf_rabitq_lib
+              cuvs-cagra-search ivf_rabitq_lib
     )
 
     # ensure CUDA symbols aren't relocated to the middle of the debug build binaries
