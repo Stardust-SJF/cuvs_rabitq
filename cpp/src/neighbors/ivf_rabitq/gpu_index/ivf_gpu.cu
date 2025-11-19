@@ -1560,10 +1560,10 @@ void sort_cluster_query_pairs(int* d_raft_idx,                   // Input: clust
   int* d_sorted_clusters;
   int* d_sorted_queries;
 
-  cudaMalloc(&d_cluster_keys, total_pairs * sizeof(int));
-  cudaMalloc(&d_query_values, total_pairs * sizeof(int));
-  cudaMalloc(&d_sorted_clusters, total_pairs * sizeof(int));
-  cudaMalloc(&d_sorted_queries, total_pairs * sizeof(int));
+  cudaMallocAsync(&d_cluster_keys, total_pairs * sizeof(int), cuda_stream);
+  cudaMallocAsync(&d_query_values, total_pairs * sizeof(int), cuda_stream);
+  cudaMallocAsync(&d_sorted_clusters, total_pairs * sizeof(int), cuda_stream);
+  cudaMallocAsync(&d_sorted_queries, total_pairs * sizeof(int), cuda_stream);
 
   // Prepare data for sorting
   int threads_per_block = 256;
@@ -1589,7 +1589,7 @@ void sort_cluster_query_pairs(int* d_raft_idx,                   // Input: clust
 
   // Allocate temporary storage
   void* d_temp_storage;
-  cudaMalloc(&d_temp_storage, temp_storage_bytes);
+  cudaMallocAsync(&d_temp_storage, temp_storage_bytes, cuda_stream);
 
   // Perform radix sort
   cub::DeviceRadixSort::SortPairs(d_temp_storage,
@@ -1635,11 +1635,11 @@ void sort_cluster_query_pairs(int* d_raft_idx,                   // Input: clust
 
   // Free temporary memory
   // jamxia edit: uncomment line below
-  cudaFree(d_temp_storage);
-  cudaFree(d_cluster_keys);
-  cudaFree(d_query_values);
-  cudaFree(d_sorted_clusters);
-  cudaFree(d_sorted_queries);
+  cudaFreeAsync(d_temp_storage, cuda_stream);
+  cudaFreeAsync(d_cluster_keys, cuda_stream);
+  cudaFreeAsync(d_query_values, cuda_stream);
+  cudaFreeAsync(d_sorted_clusters, cuda_stream);
+  cudaFreeAsync(d_sorted_queries, cuda_stream);
 }
 
 void sort_cluster_query_pairs_separate(

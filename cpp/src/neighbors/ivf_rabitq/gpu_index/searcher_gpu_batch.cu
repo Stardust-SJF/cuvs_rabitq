@@ -4050,8 +4050,8 @@ void mergeClusterTopKFinal(const float* d_topk_dists,  // Input: top-k distances
   size_t total_elements = num_queries * candidates_per_query;
 
   // Allocate temporary array for cleaned data
-  float* d_clean_dists;
-  cudaMalloc(&d_clean_dists, total_elements * sizeof(float));
+  // float* d_clean_dists;
+  // cudaMalloc(&d_clean_dists, total_elements * sizeof(float));
 
   //    // Clean the input distances
   //    int threads = 256;
@@ -4064,11 +4064,11 @@ void mergeClusterTopKFinal(const float* d_topk_dists,  // Input: top-k distances
   //    );
 
   //    cudaStreamSynchronize(stream);  // Ensure cleaning is done
-  cudaError_t err = cudaGetLastError();
-  if (err != cudaSuccess) {
-    cudaFree(d_clean_dists);
-    throw std::runtime_error(std::string("Error in cleaning kernel: ") + cudaGetErrorString(err));
-  }
+  // cudaError_t err = cudaGetLastError();
+  // if (err != cudaSuccess) {
+  //   cudaFree(d_clean_dists);
+  //   throw std::runtime_error(std::string("Error in cleaning kernel: ") + cudaGetErrorString(err));
+  // }
 #endif
 
   raft::matrix::detail::select_k(handle,
