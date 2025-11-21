@@ -10,6 +10,8 @@
 #ifndef EXRABITQ_IVF_GPU_CUH
 #define EXRABITQ_IVF_GPU_CUH
 
+#include <raft/core/resources.hpp>
+
 #include <cstdint>
 #include <cstdlib>
 #include <cuda_runtime.h>
@@ -178,9 +180,14 @@ class IVFGPU {
    * @param k Num of centroids.
    * @param bits_per_dim totalbits = EX_BITS+1
    */
-  IVFGPU(size_t n, size_t dim, size_t k, size_t bits_per_dim, bool batch_flag);
-  IVFGPU()
-    : Rota(128),
+  IVFGPU(raft::resources const& handle,
+         size_t n,
+         size_t dim,
+         size_t k,
+         size_t bits_per_dim,
+         bool batch_flag);
+  IVFGPU(raft::resources const& handle)
+    : Rota(handle, 128),
       d_short_data(nullptr),
       d_long_code(nullptr),
       d_short_factors_batch(nullptr),
@@ -201,7 +208,8 @@ class IVFGPU {
    * @param host_centroids pointer to centroids.
    * @param pids PIDs of vectors.
    */
-  void construct(const float* host_data,
+  void construct(raft::resources const& handle,
+                 const float* host_data,
                  const float* host_centroids,
                  const uint32_t* pids,
                  bool fast_quantize = false);
@@ -214,13 +222,15 @@ class IVFGPU {
    * @param k number of nearest neighbors to retrieve.
    * @param nprobe number of nearest clusters to probe.
    */
-  void search(const float* d_query,
+  void search(raft::resources const& handle,
+              const float* d_query,
               size_t k,
               size_t nprobe,
               PID* results,
               cudaStream_t single_stream = nullptr) const;
   //    void search(const float* host_query, float* results, size_t k, size_t nprobe) const;
-  void search_with_time(const float* d_query,
+  void search_with_time(raft::resources const& handle,
+                        const float* d_query,
                         size_t k,
                         size_t nprobe,
                         PID* results,
@@ -268,9 +278,9 @@ class IVFGPU {
   // load_transposed only applies for new batch index
   void save(const char* filename, bool save_batch_flag = false) const;
 
-  void load(const char* filename, bool load_batch_flag = false);
+  void load(raft::resources const& handle, const char* filename, bool load_batch_flag = false);
 
-  void load_transposed(const char* filename);
+  void load_transposed(raft::resources const& handle, const char* filename);
 
   size_t padded_dim() { return this->num_padded_dim; }
 
@@ -407,7 +417,8 @@ class IVFGPU {
   size_t GetLongCodeBytes() const { return sizeof(uint8_t) * DQ.long_code_length() * num_vectors; }
   void init_clusters(const std::vector<size_t>& cluster_sizes);
 
-  void quantize_cluster(GPUClusterMeta& cp,
+  void quantize_cluster(raft::resources const& handle,
+                        GPUClusterMeta& cp,
                         /*const std::vector<PID> &IDs,*/ const float* data,
                         const float* cur_centroid,
                         float* rotated_c) const;

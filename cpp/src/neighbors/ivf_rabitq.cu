@@ -111,7 +111,8 @@ void build(raft::resources const& handle,
   auto h_labels_array = raft::make_host_mdarray<uint32_t>(raft::make_extents<int64_t>(n_rows));
   raft::copy(h_labels_array.view().data_handle(), labels_view.data_handle(), n_rows, stream);
   // Call RaBitQ index construct
-  index->rabitq_index()->construct(h_dataset_ptr,
+  index->rabitq_index()->construct(handle,
+                                   h_dataset_ptr,
                                    h_centers_array.view().data_handle(),
                                    h_labels_array.view().data_handle(),
                                    params.fast_quantize_flag);
@@ -145,7 +146,8 @@ void search(raft::resources const& handle,
   auto rotated_queries = raft::make_device_matrix<T, int64_t>(handle, NQ, padded_dim);
 
   // TODO: replace RotatorGPU::rotate with cuVS/RAFT primitives
-  rabitq_idx->rotator().rotate(padded_queries.data_handle(), rotated_queries.data_handle(), NQ);
+  rabitq_idx->rotator().rotate(
+    handle, padded_queries.data_handle(), rotated_queries.data_handle(), NQ);
 
   auto search_mode_to_string = [](search_mode mode) -> std::string {
     switch (mode) {
@@ -156,7 +158,8 @@ void search(raft::resources const& handle,
       default: RAFT_FAIL("Invalid search mode");
     }
   };
-  ::SearcherGPU searcher(rotated_queries.data_handle(),
+  ::SearcherGPU searcher(handle,
+                         rotated_queries.data_handle(),
                          padded_dim,
                          rabitq_idx->ex_bits,
                          search_mode_to_string(params.mode),
@@ -251,30 +254,35 @@ void deserialize(raft::resources const& handle,
                  const std::string& filename,
                  cuvs::neighbors::ivf_rabitq::index<IdxT>* index)
 {
-  index->rabitq_index()->load_transposed(filename.c_str());
+  index->rabitq_index()->load_transposed(handle, filename.c_str());
 }
 
 }  // namespace detail
 
 template <typename IdxT>
-index<IdxT>::index()
+index<IdxT>::index(raft::resources const& handle)
   // this constructor is just for a temporary index, for use in the deserialization
   // api. all the parameters here will get replaced with loaded values - that aren't
   // necessarily known ahead of time before deserialization.
   // TODO: do we even need a handle here - could just construct one?
-  : rabitq_index_()
+  : rabitq_index_(handle)
 {
 }
 
 template <typename IdxT>
-index<IdxT>::index(size_t n_rows, uint32_t dim, uint32_t n_lists, uint32_t bits_per_dim)
-  : rabitq_index_(n_rows, dim, n_lists, bits_per_dim, /* batch_flag = */ true)
+index<IdxT>::index(raft::resources const& handle,
+                   size_t n_rows,
+                   uint32_t dim,
+                   uint32_t n_lists,
+                   uint32_t bits_per_dim)
+  : rabitq_index_(handle, n_rows, dim, n_lists, bits_per_dim, /* batch_flag = */ true)
 {
   RAFT_EXPECTS(bits_per_dim >= 2 && bits_per_dim <= 9, "Unsupported bits_per_dim");
 }
 
 template <typename IdxT>
-index<IdxT>::index(const index_params& params, uint32_t dim) : index()
+index<IdxT>::index(raft::resources const& handle, const index_params& params, uint32_t dim)
+  : index(handle)
 {
 }
 

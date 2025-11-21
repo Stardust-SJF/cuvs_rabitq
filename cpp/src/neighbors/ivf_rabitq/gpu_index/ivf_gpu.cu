@@ -10,6 +10,9 @@
 #include "omp.h"
 #include <chrono>
 #include <cuda_runtime.h>
+
+#include <cublas_v2.h>
+
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/query_gatherer.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/searcher_gpu.cuh>
@@ -20,7 +23,12 @@
 #include <raft/matrix/select_k.cuh>
 #include <thrust/sort.h>
 
-IVFGPU::IVFGPU(size_t n, size_t dim, size_t k, size_t bits_per_dim, bool batch_flag = false)
+IVFGPU::IVFGPU(raft::resources const& handle,
+               size_t n,
+               size_t dim,
+               size_t k,
+               size_t bits_per_dim,
+               bool batch_flag = false)
   : num_vectors(n),
     num_dimensions(dim),
     num_padded_dim(rd_up_to_multiple_of_new(dim, 64)),
@@ -38,8 +46,8 @@ IVFGPU::IVFGPU(size_t n, size_t dim, size_t k, size_t bits_per_dim, bool batch_f
     h_long_code(nullptr),
     h_ex_factor(nullptr),
     h_ids(nullptr),
-    DQ(dim, bits_per_dim - 1, batch_flag),
-    Rota(dim)
+    DQ(handle, dim, bits_per_dim - 1, batch_flag),
+    Rota(handle, dim)
 {
 }
 
@@ -143,7 +151,7 @@ void IVFGPU::FreeDeviceMemory() const
   delete initializer;
 }
 
-void IVFGPU::load(const char* filename, bool load_batch_flag)
+void IVFGPU::load(raft::resources const& handle, const char* filename, bool load_batch_flag)
 {
   std::cout << "Loading IVFGPU index... from " << filename << "\n";
   std::ifstream input(filename, std::ios::binary);
@@ -160,8 +168,8 @@ void IVFGPU::load(const char* filename, bool load_batch_flag)
   if (load_batch_flag) input.read(reinterpret_cast<char*>(&this->batch_flag), sizeof(bool));
 
   // Initialize quantizer and rotator (host objects that drive GPU routines).
-  this->DQ   = DataQuantizerGPU(num_dimensions, ex_bits, batch_flag);
-  this->Rota = RotatorGPU(num_dimensions);
+  this->DQ   = DataQuantizerGPU(handle, num_dimensions, ex_bits, batch_flag);
+  this->Rota = RotatorGPU(handle, num_dimensions);
   // Load cluster sizes.
   std::vector<size_t> cluster_sizes(num_centroids, 0);
   input.read(reinterpret_cast<char*>(cluster_sizes.data()), sizeof(size_t) * num_centroids);
@@ -219,7 +227,7 @@ void IVFGPU::load(const char* filename, bool load_batch_flag)
 }
 
 // load transposed data for short codes
-void IVFGPU::load_transposed(const char* filename)
+void IVFGPU::load_transposed(raft::resources const& handle, const char* filename)
 {
   std::cout << "Loading IVFGPU index... from " << filename << "\n";
   std::ifstream input(filename, std::ios::binary);
@@ -236,8 +244,8 @@ void IVFGPU::load_transposed(const char* filename)
   input.read(reinterpret_cast<char*>(&this->batch_flag), sizeof(bool));
 
   // Initialize quantizer and rotator (host objects that drive GPU routines).
-  this->DQ   = DataQuantizerGPU(num_dimensions, ex_bits, batch_flag);
-  this->Rota = RotatorGPU(num_dimensions);
+  this->DQ   = DataQuantizerGPU(handle, num_dimensions, ex_bits, batch_flag);
+  this->Rota = RotatorGPU(handle, num_dimensions);
   // Load cluster sizes.
   std::vector<size_t> cluster_sizes(num_centroids, 0);
   input.read(reinterpret_cast<char*>(cluster_sizes.data()), sizeof(size_t) * num_centroids);
@@ -526,7 +534,8 @@ void IVFGPU::save(const char* filename, bool save_batch_flag) const
   std::cout << "IVFGPU index saved\n";
 }
 
-void IVFGPU::construct(const float* host_data,
+void IVFGPU::construct(raft::resources const& handle,
+                       const float* host_data,
                        const float* host_centroids,
                        const PID* host_cluster_ids,
                        bool fast_quantize)
@@ -621,7 +630,7 @@ void IVFGPU::construct(const float* host_data,
 #ifdef DEBUG_BATCH_CONSTRUCT
     std::cout << "cluster size:" << h_cluster_meta[i].num << std::endl;
 #endif
-    quantize_cluster(cp, d_data, cur_centroid, cur_rotated_c);
+    quantize_cluster(handle, cp, d_data, cur_centroid, cur_rotated_c);
     if (i % 100 == 0) printf("Cluster %d quantization finished!\n", i);
   }
 
@@ -640,7 +649,8 @@ void IVFGPU::construct(const float* host_data,
                         cudaMemcpyDeviceToHost));
 }
 
-void IVFGPU::quantize_cluster(GPUClusterMeta& cp,
+void IVFGPU::quantize_cluster(raft::resources const& handle,
+                              GPUClusterMeta& cp,
                               //                              const std::vector<PID>& IDs,
                               const float* d_data,      // device pointer
                               const float* d_centroid,  // device pointer
@@ -661,7 +671,8 @@ void IVFGPU::quantize_cluster(GPUClusterMeta& cp,
   // the device pointer for IDs, the number of points, the RotatorGPU instance,
   // and pointers for the output short data, long code, ex_factor, and rotated centroid.
   if (!batch_flag) {
-    DQ.quantize(d_data,
+    DQ.quantize(handle,
+                d_data,
                 d_centroid,
                 idp,
                 num,
@@ -680,7 +691,8 @@ void IVFGPU::quantize_cluster(GPUClusterMeta& cp,
     //                              d_rotated_c);
     //        }
     //        else {
-    DQ.quantize_batch_opt(d_data,
+    DQ.quantize_batch_opt(handle,
+                          d_data,
                           d_centroid,
                           idp,
                           num,
@@ -1155,8 +1167,12 @@ void merge_knn_pools_with_stats(DeviceResultPool** knn_array,
   cudaFree(d_src);
 }
 
-void IVFGPU::search(
-  const float* d_query, size_t k, size_t nprobe, PID* results, cudaStream_t single_stream) const
+void IVFGPU::search(raft::resources const& handle,
+                    const float* d_query,
+                    size_t k,
+                    size_t nprobe,
+                    PID* results,
+                    cudaStream_t single_stream) const
 {
   // Compute distances from query to centroids on GPU.
   // d_query is on CPU now
@@ -1210,7 +1226,7 @@ void IVFGPU::search(
 
   // Create a GPU searcher instance (which uses the device query, etc.).
 #if defined(HIGH_ACC_FAST_SCAN)
-  SearcherGPU searcher(d_query, num_padded_dim, ex_bits);
+  SearcherGPU searcher(handle, d_query, num_padded_dim, ex_bits);
 #else
   //    Searcher searcher(d_query, D, EX_BITS, DQ);
 #endif
@@ -2977,7 +2993,8 @@ class CpuTimer2 {
 // ──────────────────────────────────────────────────────────────
 // Instrumented IVFGPU::search
 // ──────────────────────────────────────────────────────────────
-void IVFGPU::search_with_time(const float* d_query,
+void IVFGPU::search_with_time(raft::resources const& handle,
+                              const float* d_query,
                               size_t k,
                               size_t nprobe,
                               PID* results,
@@ -3028,7 +3045,7 @@ void IVFGPU::search_with_time(const float* d_query,
   gpu.start();
   float* centroid_data =
     static_cast<float*>(malloc(sizeof(float) * num_padded_dim * num_centroids));
-  SearcherGPU searcher(d_query, num_padded_dim, ex_bits);
+  SearcherGPU searcher(handle, d_query, num_padded_dim, ex_bits);
   for (size_t i = 0; i < nprobe; ++i) {
     cudaStream_t s = 0;  // (optionally pick from a pool) debug: only for 1 stream
 
