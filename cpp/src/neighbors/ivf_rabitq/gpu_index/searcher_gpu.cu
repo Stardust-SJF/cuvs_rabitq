@@ -1447,9 +1447,9 @@ SearcherGPU::SearcherGPU(raft::resources const& handle,
   float temp = INFINITY;
   if (mode == "quant4") {
     best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(
-      handle, d, 3);  // suppose that always quantize query to 4 bits (1 + 3) per dim
+      d, 3);  // suppose that always quantize query to 4 bits (1 + 3) per dim
   } else if (mode == "quant8") {
-    best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(handle, d, 7);
+    best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(d, 7);
   }
   cudaMalloc((void**)&d_filter_distk, sizeof(float));
   cudaMemcpy(d_filter_distk, &temp, sizeof(float), cudaMemcpyHostToDevice);

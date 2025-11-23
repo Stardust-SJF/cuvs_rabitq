@@ -689,40 +689,85 @@ inline double best_rescale_factor(const T* o_abs, size_t dim, size_t ex_bits)
   return t;
 }
 
-float DataQuantizerGPU::get_const_scaling_factors(raft::resources const& handle,
-                                                  size_t dim,
-                                                  size_t ex_bits)
-{
+// float DataQuantizerGPU::get_const_scaling_factors(raft::resources const& handle,
+//                                                   size_t dim,
+//                                                   size_t ex_bits)
+// {
+//   constexpr long kConstNum = 100;
+//
+//   // random matrix with normal distribution
+//   auto rand = raft::make_device_matrix<double, size_t>(handle, kConstNum, dim);
+//   raft::random::RngState rng(7ULL);
+//   raft::random::normal(handle, rng, rand.data_handle(), kConstNum * dim, 0., 1.);
+//   // row-wise normalization
+//   auto row_normalized = raft::make_device_matrix<double, size_t>(handle, kConstNum, dim);
+//   raft::linalg::row_normalize<raft::linalg::L2Norm, double, size_t>(
+//     handle, rand.view(), row_normalized.view());
+//   // take abs values (reusing memory allocation for `rand`)
+//   raft::linalg::map(handle,
+//                     rand.view(),
+//                     raft::abs_op{},
+//                     raft::make_device_vector_view<const double, size_t>(
+//                       row_normalized.data_handle(), kConstNum * dim));
+//   auto h_rand_row_normalized_abs = raft::make_host_matrix<double, size_t>(kConstNum, dim);
+//   raft::copy(h_rand_row_normalized_abs.data_handle(),
+//              rand.data_handle(),
+//              kConstNum * dim,
+//              raft::resource::get_cuda_stream(handle));
+//
+//   double sum = 0;
+//   for (long j = 0; j < kConstNum; ++j) {
+//     sum += best_rescale_factor(&h_rand_row_normalized_abs(j, 0), dim, ex_bits);
+//   }
+//
+//   double t_const = sum / kConstNum;
+//
+//   return (float)t_const;
+// }
+
+float DataQuantizerGPU::get_const_scaling_factors(size_t dim, size_t ex_bits) {
   constexpr long kConstNum = 100;
 
-  // random matrix with normal distribution
-  auto rand = raft::make_device_matrix<double, size_t>(handle, kConstNum, dim);
-  raft::random::RngState rng(7ULL);
-  raft::random::normal(handle, rng, rand.data_handle(), kConstNum * dim, 0., 1.);
-  // row-wise normalization
-  auto row_normalized = raft::make_device_matrix<double, size_t>(handle, kConstNum, dim);
-  raft::linalg::row_normalize<raft::linalg::L2Norm, double, size_t>(
-    handle, rand.view(), row_normalized.view());
-  // take abs values (reusing memory allocation for `rand`)
-  raft::linalg::map(handle,
-                    rand.view(),
-                    raft::abs_op{},
-                    raft::make_device_vector_view<const double, size_t>(
-                      row_normalized.data_handle(), kConstNum * dim));
-  auto h_rand_row_normalized_abs = raft::make_host_matrix<double, size_t>(kConstNum, dim);
-  raft::copy(h_rand_row_normalized_abs.data_handle(),
-             rand.data_handle(),
-             kConstNum * dim,
-             raft::resource::get_cuda_stream(handle));
+  // Align memory for SIMD operations
+  alignas(64) std::vector<double> rand(kConstNum * dim);
 
-  double sum = 0;
-  for (long j = 0; j < kConstNum; ++j) {
-    sum += best_rescale_factor(&h_rand_row_normalized_abs(j, 0), dim, ex_bits);
+#ifdef DEBUG_BATCH_CONSTRUCT
+  static std::mt19937 gen(42);
+#else
+  static thread_local std::random_device rd;
+  static thread_local std::mt19937 gen(rd());
+#endif
+  std::normal_distribution<double> dist(0.0, 1.0);
+
+  // Generate random numbers
+  std::generate(rand.begin(), rand.end(), [&]() { return dist(gen); });
+
+  double sum = 0.0;
+
+  // Process each row
+#pragma omp parallel for reduction(+:sum) if(kConstNum > 10)
+  for (long row = 0; row < kConstNum; ++row) {
+    double* __restrict__ row_ptr = rand.data() + row * dim;
+
+    // Calculate norm squared with vectorization hint
+    double norm_squared = 0.0;
+#pragma omp simd reduction(+:norm_squared)
+    for (size_t j = 0; j < dim; ++j) {
+      norm_squared += row_ptr[j] * row_ptr[j];
+    }
+
+    const double inv_norm = 1.0 / std::sqrt(norm_squared);
+
+    // Vectorizable normalization
+#pragma omp simd
+    for (size_t j = 0; j < dim; ++j) {
+      row_ptr[j] = std::fabs(row_ptr[j] * inv_norm);
+    }
+
+    sum += best_rescale_factor(row_ptr, dim, ex_bits);
   }
 
-  double t_const = sum / kConstNum;
-
-  return (float)t_const;
+  return static_cast<float>(sum / kConstNum);
 }
 
 extern __constant__ float d_kTightStart_opt[9] = {
