@@ -163,7 +163,7 @@ void search(raft::resources const& handle,
                          padded_dim,
                          rabitq_idx->ex_bits,
                          search_mode_to_string(params.mode),
-                         /* rabitq_quantize_flag = */ true);
+                         /* rabitq_quantize_flag = */ false);
 
   // find the longest cluster to allocate space
   size_t max_cluster_length = 0;

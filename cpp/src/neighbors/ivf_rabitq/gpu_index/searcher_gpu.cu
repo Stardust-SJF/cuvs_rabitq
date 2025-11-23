@@ -1445,12 +1445,12 @@ SearcherGPU::SearcherGPU(raft::resources const& handle,
   quant_query = memory::align_mm<64, int16_t>(D * sizeof(int16_t));
   // set d_filter_distk (may be unused)
   float temp = INFINITY;
-  if (mode == "quant4") {
-    best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(
-      d, 3);  // suppose that always quantize query to 4 bits (1 + 3) per dim
-  } else if (mode == "quant8") {
-    best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(d, 7);
-  }
+  // if (mode == "quant4") {
+  //   best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(
+  //     d, 3);  // suppose that always quantize query to 4 bits (1 + 3) per dim
+  // } else if (mode == "quant8") {
+  //   best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(d, 7);
+  // }
   cudaMalloc((void**)&d_filter_distk, sizeof(float));
   cudaMemcpy(d_filter_distk, &temp, sizeof(float), cudaMemcpyHostToDevice);
 }
