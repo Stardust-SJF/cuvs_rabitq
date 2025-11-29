@@ -91,7 +91,7 @@ class DataQuantizerGPU {
   //        return ((dim + mult - 1) / mult) * mult;
   //    };
  public:
-  static float get_const_scaling_factors(size_t dim, size_t ex_bits);
+  static float get_const_scaling_factors(raft::resources const& handle, size_t dim, size_t ex_bits);
   // Constructor: initialize from dimension and bit count.
   explicit DataQuantizerGPU(raft::resources const& handle,
                             size_t dim,
@@ -110,7 +110,7 @@ class DataQuantizerGPU {
       handle_(handle),
       stream_(raft::resource::get_cuda_stream(handle_))
   {
-    const_scaling_factor = get_const_scaling_factors(dim, b);
+    const_scaling_factor = get_const_scaling_factors(handle_ ,dim, b);
   }
 
   // Disable copy assignment
