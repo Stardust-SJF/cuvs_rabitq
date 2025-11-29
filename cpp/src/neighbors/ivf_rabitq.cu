@@ -95,26 +95,11 @@ void build(raft::resources const& handle,
                                           labels_view,
                                           utils::mapping<float>());
 
-  // TODO: make IVFGPU::construct work on device data only
-  T* h_dataset_ptr     = nullptr;
-  auto h_dataset_array = raft::make_host_mdarray<T>(raft::make_extents<int64_t>(0, 0));
-  if constexpr (raft::is_host_mdspan_v<decltype(dataset)>) {
-    h_dataset_ptr = dataset.data_handle();
-  } else {
-    h_dataset_array = raft::make_host_mdarray<T>(raft::make_extents<int64_t>(n_rows, dim));
-    raft::copy(h_dataset_array.view().data_handle(), dataset.data_handle(), n_rows * dim, stream);
-    h_dataset_ptr = h_dataset_array.data_handle();
-  }
-  auto h_centers_array =
-    raft::make_host_mdarray<float>(raft::make_extents<int64_t>(params.n_lists, dim));
-  raft::copy(h_centers_array.view().data_handle(), cluster_centers, params.n_lists * dim, stream);
-  auto h_labels_array = raft::make_host_mdarray<uint32_t>(raft::make_extents<int64_t>(n_rows));
-  raft::copy(h_labels_array.view().data_handle(), labels_view.data_handle(), n_rows, stream);
   // Call RaBitQ index construct
-  index->rabitq_index().construct(h_dataset_ptr,
-                                  h_centers_array.view().data_handle(),
-                                  h_labels_array.view().data_handle(),
-                                  params.fast_quantize_flag);
+  index->rabitq_index().construct_on_gpu(dataset.data_handle(),
+                                cluster_centers,
+                                labels_view.data_handle(),
+                                params.fast_quantize_flag);
 }
 
 template <typename T, typename IdxT>
@@ -161,6 +146,7 @@ void search(raft::resources const& handle,
                                padded_dim,
                                idx.rabitq_index().get_ex_bits(),
                                search_mode_to_string(params.mode),
+                               idx.rabitq_index().quantizer().get_query_scaling_factor_write_buffer(),
                                /* rabitq_quantize_flag = */ true);
 
   // find the longest cluster to allocate space

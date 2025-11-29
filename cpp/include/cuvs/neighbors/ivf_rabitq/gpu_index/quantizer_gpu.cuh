@@ -40,6 +40,12 @@ typedef uint32_t PID;
  * stub functions with CUDA kernels and device‐side implementations.
  */
 class DataQuantizerGPU {
+public:
+  struct FastQuantizeFactors {
+    float const_scaling_factor_4bit;
+    float const_scaling_factor_8bit;
+  };
+
  private:
   size_t DIM;                // Original data dimension.
   size_t D;                  // Padded dimension (multiple of 64).
@@ -50,6 +56,8 @@ class DataQuantizerGPU {
   double FAC_ERR;
   bool batch_flag_dq;
   float const_scaling_factor;
+  FastQuantizeFactors fast_quantize_factors;
+  static constexpr size_t FAST_SIZE = 4;
 #if defined(HIGH_ACC_FAST_SCAN)
   static constexpr size_t NUM_SHORT_FACTORS = 1;
 #else
@@ -92,6 +100,8 @@ class DataQuantizerGPU {
   //    };
  public:
   static float get_const_scaling_factors(raft::resources const& handle, size_t dim, size_t ex_bits);
+
+  float get_const_scaling_factors_fully_gpu(size_t dim, size_t ex_bits);
   // Constructor: initialize from dimension and bit count.
   explicit DataQuantizerGPU(raft::resources const& handle,
                             size_t dim,
@@ -107,11 +117,10 @@ class DataQuantizerGPU {
       FAC_ERR(2.0 / std::sqrt((double)(D - 1))),
       batch_flag_dq(batch_flag_dq),
       fast_quantize_flag(false),
+      const_scaling_factor(0.0f),
       handle_(handle),
       stream_(raft::resource::get_cuda_stream(handle_))
-  {
-    const_scaling_factor = get_const_scaling_factors(handle_ ,dim, b);
-  }
+  {}
 
   // Disable copy assignment
   DataQuantizerGPU& operator=(const DataQuantizerGPU& other) = delete;
@@ -131,6 +140,18 @@ class DataQuantizerGPU {
   }  // May be useless
   size_t num_blocks(size_t num) const { return div_rd_up_new(num, FAST_SIZE); }
   static constexpr size_t num_short_factors() { return NUM_SHORT_FACTORS; }
+  const FastQuantizeFactors* get_query_scaling_factor_addr() const { return &fast_quantize_factors;}
+  FastQuantizeFactors* get_query_scaling_factor_write_buffer() { return &fast_quantize_factors;   }
+  void set_query_scaling_factors(size_t dim) {
+    fast_quantize_factors.const_scaling_factor_4bit = get_const_scaling_factors_fully_gpu(dim, 3);
+    fast_quantize_factors.const_scaling_factor_8bit = get_const_scaling_factors_fully_gpu(dim, 7);
+  }
+  void set_quantize_scaling_factors() {
+    const_scaling_factor = get_const_scaling_factors_fully_gpu(D, EX_BITS);
+  }
+  void set_quantize_scaling_factors_by_value(float value) {
+    const_scaling_factor = value;
+  }
 
   /*!
    * @brief Quantize the input data.

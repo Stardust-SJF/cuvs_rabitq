@@ -1440,12 +1440,12 @@ void SearcherGPU::SearchClustershowingTime(const IVFGPU& cur_ivf,
   std::cout << std::left << std::setw(22) << "TOTAL" << std::right << std::setw(12) << std::fixed
             << std::setprecision(3) << total_ms << '\n';
 }
-
-SearcherGPU::SearcherGPU(raft::resources const& handle,
+  SearcherGPU::SearcherGPU(raft::resources const& handle,
                          const float* q,
                          size_t d,
                          size_t ex_bits,
-                         std::string mode,
+                         std::string mode ,
+                         DataQuantizerGPU::FastQuantizeFactors* fast_quantize_factors,
                          bool rabitq_quantize_flag)
   : D(d),
     query(q),
@@ -1460,11 +1460,14 @@ SearcherGPU::SearcherGPU(raft::resources const& handle,
   quant_query = memory::align_mm<64, int16_t>(D * sizeof(int16_t));
   // set d_filter_distk (may be unused)
   float temp = INFINITY;
-  if (mode == "quant4") {
-    best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(
-      handle, d, 3);  // suppose that always quantize query to 4 bits (1 + 3) per dim
-  } else if (mode == "quant8") {
-    best_rescaling_factor = DataQuantizerGPU::get_const_scaling_factors(handle, d, 7);
+  if (mode == "quant4" && fast_quantize_factors != nullptr) {
+    best_rescaling_factor = fast_quantize_factors->const_scaling_factor_4bit;  // suppose that always quantize query to 4 bits (1 + 3) per dim
+  }
+  else if (mode == "quant8" && fast_quantize_factors != nullptr) {
+    best_rescaling_factor = fast_quantize_factors->const_scaling_factor_8bit;
+  }
+  else if (!fast_quantize_factors && (mode == "quant4" || mode == "quant8")) {
+    std::cerr << "ERROR: fast_quantize_factors must be set for quant4/quant8 mode" << std::endl;
   }
   RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_filter_distk, sizeof(float), stream_));
   RAFT_CUDA_TRY(
