@@ -7,21 +7,31 @@
 // Created by Stardust on 2/23/25.
 //
 
-#ifndef EXRABITQ_IVF_GPU_CUH
-#define EXRABITQ_IVF_GPU_CUH
+#pragma once
 
-#include <raft/core/resources.hpp>
-
-#include <cstdint>
-#include <cstdlib>
-#include <cuda_runtime.h>
 #include <cuvs/neighbors/ivf_rabitq/defines.hpp>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/initializer_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/pool_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/quantizer_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/rotator_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/utils/utils_cuda.cuh>
+
+#include <raft/core/device_mdarray.hpp>
+#include <raft/core/host_mdarray.hpp>
+#include <raft/core/mdspan_types.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resources.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+
+#include <cuda_runtime.h>
+
+#include <cstdint>
+#include <cstdlib>
+#include <memory>
 #include <vector>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 // Structure for cluster-query pairs
 struct ClusterQueryPair {
@@ -39,38 +49,23 @@ class IVFGPU {
     size_t start_index;  // Combined offset: index of first vector in the flattened arrays.
 
     // Constructor: computes iter and REMAIN based on FAST_SIZE.
-    __host__ GPUClusterMeta(size_t num, size_t start_idx) : num(num), start_index(start_idx)
+    GPUClusterMeta(size_t num, size_t start_idx) : num(num), start_index(start_idx)
     {
       iter   = num / FAST_SIZE;
       remain = num - iter * FAST_SIZE;
     }
 
     // default constructor (useful for vector initialize)
-    __host__ GPUClusterMeta() : num(0), iter(0), remain(0), start_index(0) {}
+    GPUClusterMeta() : num(0), iter(0), remain(0), start_index(0) {}
 
     // Copy constructor.
-    __host__ GPUClusterMeta(const GPUClusterMeta& other) = default;
+    GPUClusterMeta(const GPUClusterMeta& other) = default;
 
-    // Move constructor.（Would there be a memory leak if using this?
-    __host__ GPUClusterMeta(GPUClusterMeta&& other) noexcept
-      : num(other.num), iter(other.iter), remain(other.remain), start_index(other.start_index)
-    {
-    }
+    // Copy assignment.
+    GPUClusterMeta& operator=(const GPUClusterMeta& other) = default;
 
-    __host__ __device__ GPUClusterMeta& operator=(const GPUClusterMeta& other)
-    {
-      // self-assignment check is cheap and avoids UB if someone
-      // ever writes “meta = meta;”
-      if (this != &other) {
-        num         = other.num;
-        iter        = other.iter;
-        remain      = other.remain;
-        start_index = other.start_index;
-      }
-      return *this;
-    }
     // Destructor.
-    __host__ __device__ ~GPUClusterMeta() = default;
+    ~GPUClusterMeta() = default;
 
     /**
      * @brief Compute pointer to the first block of quantized short data. note that short code
@@ -83,14 +78,16 @@ class IVFGPU {
     // __host__ __device__
     __host__ uint32_t* first_block(const IVFGPU& parent) const
     {
-      return parent.d_short_data +
-             start_index * (parent.DQ.short_code_length() + parent.DQ.num_short_factors());
+      return parent.get_short_data_device() +
+             start_index *
+               (parent.quantizer().short_code_length() + parent.quantizer().num_short_factors());
     }
 
     // for batch data, factors are stored separately.
     uint32_t* first_block_batch(const IVFGPU& parent) const
     {
-      return parent.d_short_data + start_index * (parent.DQ.short_code_length());
+      return parent.get_short_data_device() +
+             start_index * (parent.quantizer().short_code_length());
     }
 
     __device__ uint32_t* first_block_gpu(uint32_t* d_short_data,
@@ -104,13 +101,13 @@ class IVFGPU {
     // __host__ __device__
     __host__ uint32_t* first_block_host(const IVFGPU& parent) const
     {
-      return parent.h_short_data +
-             start_index * (parent.DQ.short_code_length() + parent.DQ.num_short_factors());
+      return parent.get_short_data_host() + start_index * (parent.quantizer().short_code_length() +
+                                                           parent.quantizer().num_short_factors());
     }
 
     float* short_factor_batch(const IVFGPU& parent, size_t i) const
     {
-      return parent.d_short_factors_batch + (start_index + i) * 3;
+      return parent.get_short_factors_batch_device() + (start_index + i) * 3;
     }
 
     /**
@@ -125,14 +122,14 @@ class IVFGPU {
                                            size_t i,
                                            size_t long_code_length) const
     {
-      return parent.d_long_code + (start_index + i) * long_code_length;
+      return parent.get_long_code_device() + (start_index + i) * long_code_length;
     }
 
     __host__ __device__ uint8_t* long_code_host(const IVFGPU& parent,
                                                 size_t i,
                                                 size_t long_code_length) const
     {
-      return parent.h_long_code + (start_index + i) * long_code_length;
+      return parent.get_long_code_host() + (start_index + i) * long_code_length;
     }
 
     /**
@@ -144,18 +141,18 @@ class IVFGPU {
      */
     __host__ __device__ ExFactor* ex_factor(const IVFGPU& parent, size_t i) const
     {
-      return parent.d_ex_factor + start_index + i;
+      return parent.get_ex_factor_device() + start_index + i;
     }
 
     // two ex_factors are stored
     ExFactor* ex_factor_batch(const IVFGPU& parent, size_t i) const
     {
-      return parent.d_ex_factor + (start_index + i) * 2;
+      return parent.get_ex_factor_device() + (start_index + i) * 2;
     }
 
     ExFactor* ex_factor_host(const IVFGPU& parent, size_t i) const
     {
-      return parent.h_ex_factor + start_index + i;
+      return parent.get_ex_factor_host() + start_index + i;
     }
 
     /**
@@ -164,11 +161,14 @@ class IVFGPU {
      * @param parent Pointer to the IVFGPU instance that holds the base pointer.
      * @return Pointer to the first ID in this cluster.
      */
-    __host__ __device__ PID* ids(const IVFGPU& parent) const { return parent.d_ids + start_index; }
+    __host__ __device__ PID* ids(const IVFGPU& parent) const
+    {
+      return parent.get_ids_device() + start_index;
+    }
 
     __host__ __device__ PID* ids_host(const IVFGPU& parent) const
     {
-      return parent.h_ids + start_index;
+      return parent.get_ids_host() + start_index;
     }
   };
 
@@ -187,19 +187,24 @@ class IVFGPU {
          size_t bits_per_dim,
          bool batch_flag);
   IVFGPU(raft::resources const& handle)
-    : Rota(handle, 128),
-      d_short_data(nullptr),
-      d_long_code(nullptr),
-      d_short_factors_batch(nullptr),
-      d_ex_factor(nullptr),
-      d_ids(nullptr),
+    : handle_(handle),
+      stream_(raft::resource::get_cuda_stream(handle_)),
+      short_data_(raft::make_device_vector<uint32_t, int64_t>(handle_, 0)),
+      long_code_(raft::make_device_vector<uint8_t, int64_t>(handle_, 0)),
+      ex_factor_(raft::make_device_vector<ExFactor, int64_t>(handle_, 0)),
+      ids_(raft::make_device_vector<PID, int64_t>(handle_, 0)),
+      cluster_meta_(raft::make_device_vector<GPUClusterMeta, int64_t>(handle_, 0)),
+      batch_flag(false),
+      short_factors_batch_(raft::make_device_vector<float, int64_t>(handle_, 0)),
+      short_data_host_(raft::make_host_vector<uint32_t, int64_t>(0)),
+      long_code_host_(raft::make_host_vector<uint8_t, int64_t>(0)),
+      ex_factor_host_(raft::make_host_vector<ExFactor, int64_t>(0)),
+      ids_host_(raft::make_host_vector<PID, int64_t>(0)),
+      cluster_meta_host_(raft::make_host_vector<GPUClusterMeta, int64_t>(0)),
       initializer(nullptr),
-      d_cluster_meta(nullptr),
-      batch_flag(false)
+      Rota(std::make_unique<RotatorGPU>(handle_, 128))
   {
   }
-
-  ~IVFGPU();
 
   /**
    * @brief Build function
@@ -208,8 +213,7 @@ class IVFGPU {
    * @param host_centroids pointer to centroids.
    * @param pids PIDs of vectors.
    */
-  void construct(raft::resources const& handle,
-                 const float* host_data,
+  void construct(const float* host_data,
                  const float* host_centroids,
                  const uint32_t* pids,
                  bool fast_quantize = false);
@@ -222,71 +226,82 @@ class IVFGPU {
    * @param k number of nearest neighbors to retrieve.
    * @param nprobe number of nearest clusters to probe.
    */
-  void search(raft::resources const& handle,
-              const float* d_query,
-              size_t k,
-              size_t nprobe,
-              PID* results,
-              cudaStream_t single_stream = nullptr) const;
+  void search(const float* d_query, size_t k, size_t nprobe, PID* results) const;
   //    void search(const float* host_query, float* results, size_t k, size_t nprobe) const;
-  void search_with_time(raft::resources const& handle,
-                        const float* d_query,
+  void search_with_time(const float* d_query,
                         size_t k,
                         size_t nprobe,
                         PID* results,
                         std::vector<int>& probe_hist) const;
-  // Device pointers for each data array.
-  InitializerGPU*
-    initializer;  // Initializer, indicates which initializer to use (currently only FlatIVF)
-  uint32_t* d_short_data;          // RaBitQ code and factors.
-  uint8_t* d_long_code;            // ExRaBitQ code.
-  ExFactor* d_ex_factor;           // ExRaBitQ factor.
-  PID* d_ids;                      // PID of vectors。
-  GPUClusterMeta* d_cluster_meta;  // Device-side array of clusters.  Replace std::vector with a raw
-                                   // pointer for clusters.
-
-  // batch-data
-  bool batch_flag;
-  //    uint32_t* d_short_data_batch;   // rabitq codes
-  float* d_short_factors_batch;  // N * 3 float rabitq factors
-  // d_long_code is the same
-  // exfactor use the same place as before
-
-  // host-side copies
-  std::vector<GPUClusterMeta> h_cluster_meta;  // Host-side copy of clusters
-  //    float* d_centroids;      // Device centroids (if needed for search, now stored in
-  //    initializer).
-
-  uint32_t* h_short_data;  // TODO: CPU side, we need on factors from h_short_data, so no need to
-                           // store all these codes
-  uint8_t* h_long_code;    // ExRaBitQ code.
-  ExFactor* h_ex_factor;   // ExRaBitQ factor.
-  PID* h_ids;              // PID of vectors。
-
-  // Index meta-data.
-  size_t num_vectors;     // Total number of vectors.
-  size_t num_dimensions;  // Dimensionality of the input vectors.
-  size_t num_padded_dim;  // padded dimensions
-  size_t num_centroids;   // Centroids && Clusters
-  size_t max_cluster_length;
-  size_t ex_bits;  // Extra bits parameter for quantization.
-
-  DataQuantizerGPU DQ;  // Data quantizer.
-  RotatorGPU Rota;      // Data Rotator.
 
   // save_batch_flag and load_batch_flag are add for compatity with the previous non-batch index,
   // load_transposed only applies for new batch index
   void save(const char* filename, bool save_batch_flag = false) const;
 
-  void load(raft::resources const& handle, const char* filename, bool load_batch_flag = false);
+  void load(const char* filename, bool load_batch_flag = false);
 
-  void load_transposed(raft::resources const& handle, const char* filename);
+  void load_transposed(const char* filename);
 
-  size_t padded_dim() { return this->num_padded_dim; }
+  // device data getters
+  __host__ __device__ uint32_t* get_short_data_device() const noexcept
+  {
+    return const_cast<uint32_t*>(this->short_data_.data_handle());
+  }
+  __host__ __device__ uint8_t* get_long_code_device() const noexcept
+  {
+    return const_cast<uint8_t*>(this->long_code_.data_handle());
+  }
+  __host__ __device__ ExFactor* get_ex_factor_device() const noexcept
+  {
+    return const_cast<ExFactor*>(this->ex_factor_.data_handle());
+  }
+  __host__ __device__ PID* get_ids_device() const noexcept
+  {
+    return const_cast<PID*>(this->ids_.data_handle());
+  }
+  __host__ __device__ float* get_short_factors_batch_device() const noexcept
+  {
+    return const_cast<float*>(this->short_factors_batch_.data_handle());
+  }
 
-  RotatorGPU& rotator() { return this->Rota; }
+  // host data getters
+  raft::host_vector<GPUClusterMeta, int64_t> const& get_cluster_meta_host()
+  {
+    return cluster_meta_host_;
+  }
+  __host__ __device__ uint32_t* get_short_data_host() const noexcept
+  {
+    return const_cast<uint32_t*>(short_data_host_.data_handle());
+  }
+  __host__ __device__ uint8_t* get_long_code_host() const noexcept
+  {
+    return const_cast<uint8_t*>(long_code_host_.data_handle());
+  }
+  __host__ __device__ ExFactor* get_ex_factor_host() const noexcept
+  {
+    return const_cast<ExFactor*>(ex_factor_host_.data_handle());
+  }
+  __host__ __device__ PID* get_ids_host() const noexcept
+  {
+    return const_cast<PID*>(ids_host_.data_handle());
+  }
 
-  size_t num_clusters() const { return num_centroids; }
+  // metadata getters
+  size_t get_num_dimensions() const noexcept { return this->num_dimensions; }
+  size_t get_num_padded_dim() const noexcept { return this->num_padded_dim; }
+  size_t get_num_centroids() const { return num_centroids; }
+  size_t get_max_cluster_length() const noexcept { return max_cluster_length; }
+  size_t get_ex_bits() const noexcept { return ex_bits; }
+
+  // member object getters
+  DataQuantizerGPU& quantizer() const { return *(this->DQ); }
+  RotatorGPU& rotator() const { return *(this->Rota); }
+
+  // metadata setters
+  void set_max_cluster_length(size_t new_max_cluster_length)
+  {
+    max_cluster_length = new_max_cluster_length;
+  }
 
   void MemOptimizedSearch(
     const float* d_query, size_t k, size_t nprobe, PID* results, void* searcher) const;
@@ -305,7 +320,6 @@ class IVFGPU {
                           size_t nprobe,
                           PID* results,
                           void* searcher1,
-                          cudaStream_t single_stream,
                           DeviceResultPool** knn_array,
                           std::vector<Candidate>& centroid_candidates) const;
 
@@ -317,8 +331,7 @@ class IVFGPU {
                           float* d_topk_dists,
                           float* d_final_dists,
                           PID* d_topk_pids,
-                          PID* d_final_pids,
-                          cudaStream_t single_stream);
+                          PID* d_final_pids);
 
   void BatchClusterSearchPreComputeThresholds(const float* d_query,
                                               size_t k,
@@ -328,8 +341,7 @@ class IVFGPU {
                                               float* d_topk_dists,
                                               float* d_final_dists,
                                               PID* d_topk_pids,
-                                              PID* d_final_pids,
-                                              cudaStream_t single_stream);
+                                              PID* d_final_pids);
 
   void BatchClusterSearchLUT16(const float* d_query,
                                size_t k,
@@ -339,8 +351,7 @@ class IVFGPU {
                                float* d_topk_dists,
                                float* d_final_dists,
                                PID* d_topk_pids,
-                               PID* d_final_pids,
-                               cudaStream_t single_stream);
+                               PID* d_final_pids);
 
   void BatchClusterSearchQuantizeQuery(const float* d_query,
                                        size_t k,
@@ -351,24 +362,14 @@ class IVFGPU {
                                        float* d_final_dists,
                                        PID* d_topk_pids,
                                        PID* d_final_pids,
-                                       int query_bits,
-                                       cudaStream_t single_stream);
+                                       int query_bits);
 
  private:
-  //    // Host copy of per-cluster metadata.
-  //    std::vector<GPUClusterMeta> h_cluster_meta;
-
   /**
    * @brief function to allocate memory based on the cluster
    *
-   * @param cluster_sizes
    */
-  void AllocateDeviceMemory(size_t* cluster_sizes, size_t num_clusters);
-
-  /**
-   * @brief function to free all memory
-   */
-  void FreeDeviceMemory() const;
+  void AllocateDeviceMemory();
 
   // Following are inline functions to compute spaces for memory allocation
 
@@ -380,7 +381,7 @@ class IVFGPU {
   //        for (auto s = 0; s < num_clusters; s++) {
   //            total_blocks += cluster_sizes[s];
   //        }
-  //        return total_blocks * DQ.block_bytes();
+  //        return total_blocks * this->quantizer().block_bytes();
   //    }
 
   size_t GetShortDataBytesSimple() const
@@ -390,7 +391,7 @@ class IVFGPU {
     //        for (auto s = 0; s < num_clusters; s++) {
     //            total_blocks += cluster_sizes[s];
     //        }
-    return num_vectors * DQ.block_bytes();
+    return num_vectors * this->quantizer().block_bytes();
   }
 
   size_t GetShortDataFactorBytesBatch() const
@@ -414,25 +415,67 @@ class IVFGPU {
 
   size_t GetPIDsBytes() const { return sizeof(PID) * num_vectors; }
 
-  size_t GetLongCodeBytes() const { return sizeof(uint8_t) * DQ.long_code_length() * num_vectors; }
+  size_t GetLongCodeBytes() const
+  {
+    return sizeof(uint8_t) * quantizer().long_code_length() * num_vectors;
+  }
   void init_clusters(const std::vector<size_t>& cluster_sizes);
 
-  void quantize_cluster(raft::resources const& handle,
-                        GPUClusterMeta& cp,
+  void quantize_cluster(GPUClusterMeta& cp,
                         /*const std::vector<PID> &IDs,*/ const float* data,
                         const float* cur_centroid,
                         float* rotated_c) const;
 
-  void AllocateHostMemory(size_t* cluster_sizes, size_t num_clusters);
-
-  void FreeHostMemory() const;
+  void AllocateHostMemory();
 
   void BatchClusterSearchGather(const float* d_query,
                                 size_t k,
                                 size_t nprobe,
                                 void* searcher,
                                 size_t batch_size,
-                                cudaStream_t single_stream);
+                                rmm::cuda_stream_view single_stream);
+
+  raft::resources const& handle_;  // reusable resource handle
+  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
+
+  // Device pointers for each data array.
+  raft::device_vector<uint32_t, int64_t> short_data_;          // RaBitQ code and factors.
+  raft::device_vector<uint8_t, int64_t> long_code_;            // ExRaBitQ code.
+  raft::device_vector<ExFactor, int64_t> ex_factor_;           // ExRaBitQ factor.
+  raft::device_vector<PID, int64_t> ids_;                      // PID of vectors.
+  raft::device_vector<GPUClusterMeta, int64_t> cluster_meta_;  // Device-side array of clusters.
+
+  // batch-data
+  bool batch_flag;
+  //    uint32_t* d_short_data_batch;   // rabitq codes
+  raft::device_vector<float, int64_t> short_factors_batch_;  // N * 3 float rabitq factors
+  // long_code_ is the same
+  // exfactor use the same place as before
+
+  // host-side copies
+  //    float* d_centroids;      // Device centroids (if needed for search, now stored in
+  //    initializer).
+
+  raft::host_vector<uint32_t, int64_t>
+    short_data_host_;  // TODO: CPU side, we need on factors from short_data_host_, so no need to
+                       // store all these codes
+  raft::host_vector<uint8_t, int64_t> long_code_host_;            // ExRaBitQ code.
+  raft::host_vector<ExFactor, int64_t> ex_factor_host_;           // ExRaBitQ factor.
+  raft::host_vector<PID, int64_t> ids_host_;                      // PID of vectors.
+  raft::host_vector<GPUClusterMeta, int64_t> cluster_meta_host_;  // Host-side copy of clusters
+
+  // Index meta-data.
+  size_t num_vectors;     // Total number of vectors.
+  size_t num_dimensions;  // Dimensionality of the input vectors.
+  size_t num_padded_dim;  // padded dimensions
+  size_t num_centroids;   // Centroids && Clusters
+  size_t max_cluster_length;
+  size_t ex_bits;  // Extra bits parameter for quantization.
+
+  std::unique_ptr<InitializerGPU>
+    initializer;  // Initializer, indicates which initializer to use (currently only FlatIVF)
+  std::unique_ptr<DataQuantizerGPU> DQ;  // Data quantizer.
+  std::unique_ptr<RotatorGPU> Rota;      // Data Rotator.
 };
 
-#endif  // EXRABITQ_IVF_GPU_CUH
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

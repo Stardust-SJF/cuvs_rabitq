@@ -7,7 +7,11 @@
 // Created by Stardust on 3/4/25.
 //
 
+#pragma once
+
 #include <iostream>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 #define CUDA_CHECK(call)                                                  \
   do {                                                                    \
@@ -27,3 +31,5 @@
       std::exit(EXIT_FAILURE);                                                                \
     }                                                                                         \
   } while (0)
+
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

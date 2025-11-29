@@ -7,8 +7,7 @@
 // Created by Stardust on 3/10/25.
 //
 
-#ifndef EXRABITQ_QUANTIZER_GPU_CUH
-#define EXRABITQ_QUANTIZER_GPU_CUH
+#pragma once
 
 #include <cassert>
 #include <cmath>
@@ -24,7 +23,10 @@
 #include <cuvs/neighbors/ivf_rabitq/utils/space_cuda.cuh>
 #include <cuvs/neighbors/ivf_rabitq/utils/tools_gpu.cuh>
 
+#include <raft/core/resource/cuda_stream.hpp>
 #include <raft/core/resources.hpp>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 // Define PID and ExFactor as in your CPU version.
 typedef uint32_t PID;
@@ -53,6 +55,8 @@ class DataQuantizerGPU {
 #else
   static constexpr size_t NUM_SHORT_FACTORS = 4;
 #endif
+  raft::resources const& handle_;  // reusable resource handle
+  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
 
   // Private helper functions (to be implemented with GPU kernels eventually):
   //    void pack_binary(const int* /*int matrix*/, uint64_t* out, size_t index) const;
@@ -102,28 +106,15 @@ class DataQuantizerGPU {
       FAC_NORM(1 / std::sqrt((double)D)),
       FAC_ERR(2.0 / std::sqrt((double)(D - 1))),
       batch_flag_dq(batch_flag_dq),
-      fast_quantize_flag(false)
+      fast_quantize_flag(false),
+      handle_(handle),
+      stream_(raft::resource::get_cuda_stream(handle_))
   {
     const_scaling_factor = get_const_scaling_factors(dim, b);
   }
 
-  explicit DataQuantizerGPU() {}
-
-  // Assignment operator.
-  DataQuantizerGPU& operator=(const DataQuantizerGPU& other)
-  {
-    this->DIM                  = other.DIM;
-    this->D                    = other.D;
-    this->EX_BITS              = other.EX_BITS;
-    this->SHORT_CODE_LENGTH    = other.SHORT_CODE_LENGTH;
-    this->LONG_CODE_LENGTH     = other.LONG_CODE_LENGTH;
-    this->FAC_NORM             = other.FAC_NORM;
-    this->FAC_ERR              = other.FAC_ERR;
-    this->batch_flag_dq        = other.batch_flag_dq;
-    this->fast_quantize_flag   = other.fast_quantize_flag;
-    this->const_scaling_factor = other.const_scaling_factor;
-    return *this;
-  }
+  // Disable copy assignment
+  DataQuantizerGPU& operator=(const DataQuantizerGPU& other) = delete;
 
   // Accessor functions.
   size_t short_code_length() const { return SHORT_CODE_LENGTH; }
@@ -158,8 +149,7 @@ class DataQuantizerGPU {
   //                  const RotatorGPU& rotator,
   //                  uint8_t* outShort, uint8_t* outLong, ExFactor* outExFactor, float* outTemp)
   //                  const;
-  void quantize(raft::resources const& handle,
-                const float* d_data,
+  void quantize(const float* d_data,
                 const float* d_centroid,
                 const PID* d_IDs,
                 size_t num_points,
@@ -182,8 +172,7 @@ class DataQuantizerGPU {
    * @param outTemp Temporary buffer.
    */
 
-  void quantize_batch(raft::resources const& handle,
-                      const float* d_data,
+  void quantize_batch(const float* d_data,
                       const float* d_centroid,
                       const PID* d_IDs,
                       size_t num_points,
@@ -194,8 +183,7 @@ class DataQuantizerGPU {
                       float* d_ex_factor,
                       float* d_rotated_c) const;
 
-  void quantize_batch_opt(raft::resources const& handle,
-                          const float* d_data,
+  void quantize_batch_opt(const float* d_data,
                           const float* d_centroid,
                           const PID* d_IDs,
                           size_t num_points,
@@ -255,8 +243,7 @@ class DataQuantizerGPU {
   //                             const std::vector<PID>& pids,
   //                             const RotatorGPU& rotator,
   //                             float* out, float* floatMat, int* intMat) const;
-  void data_transformation(raft::resources const& handle,
-                           const float* d_data,
+  void data_transformation(const float* d_data,
                            const float* d_centroid,
                            const PID* d_IDs,
                            size_t num_points,
@@ -265,8 +252,7 @@ class DataQuantizerGPU {
                            float* d_XP_norm,
                            int* d_bin_XP) const;
 
-  void data_transformation_batch(raft::resources const& handle,
-                                 const float* d_data,
+  void data_transformation_batch(const float* d_data,
                                  const float* d_centroid,
                                  const PID* d_IDs,
                                  size_t num_points,
@@ -276,8 +262,7 @@ class DataQuantizerGPU {
                                  int* d_bin_XP,
                                  float* d_XP) const;
 
-  void data_transformation_batch_opt(raft::resources const& handle,
-                                     const float* d_data,
+  void data_transformation_batch_opt(const float* d_data,
                                      const float* d_centroid,
                                      const PID* d_IDs,
                                      size_t num_points,
@@ -328,4 +313,4 @@ class DataQuantizerGPU {
                                             size_t num_points) const;
 };
 
-#endif  // EXRABITQ_QUANTIZER_GPU_CUH
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

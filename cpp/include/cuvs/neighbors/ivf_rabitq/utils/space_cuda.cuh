@@ -3,12 +3,15 @@
  * SPDX-License-Identifier: Apache-2.0
  */
 
-#ifndef EXRABITQ_SPACE_CUDA_H
-#define EXRABITQ_SPACE_CUDA_H
+#pragma once
+
+#include <raft/core/resources.hpp>
 
 #include <thrust/device_vector.h>
 #include <thrust/functional.h>
 #include <thrust/transform_reduce.h>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 struct L2Functor {
   __host__ __device__ float operator()(const thrust::tuple<float, float>& t) const
@@ -20,11 +23,11 @@ struct L2Functor {
   }
 };
 
-float L2SqrThrust(const float* h_x, const float* h_y, size_t N);
+float L2SqrThrust(raft::resources const& handle, const float* h_x, const float* h_y, size_t N);
 
 float L2SqrCPU_STL(const float* h_x, const float* h_y, size_t N);
 
-float L2Sqr_CUDA(const float* x, const float* y, size_t L);
+float L2Sqr_CUDA(raft::resources const& handle, const float* x, const float* y, size_t L);
 
 void high_acc_quantize16_scalar(int16_t* __restrict__ result,
                                 const float* __restrict__ q,
@@ -70,4 +73,4 @@ inline float compute_sum_q(const float* __restrict__ q, size_t D)
   return sum;  // same as _mm512_reduce_add_ps
 }
 
-#endif  // EXRABITQ_SPACE_CUDA_H
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

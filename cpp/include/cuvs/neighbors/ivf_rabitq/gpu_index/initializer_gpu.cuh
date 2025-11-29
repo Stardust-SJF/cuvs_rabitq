@@ -7,16 +7,21 @@
 // Created by Stardust on 3/3/25.
 //
 
-#ifndef EXRABITQ_INITIALIZER_GPU_CUH
-#define EXRABITQ_INITIALIZER_GPU_CUH
+#pragma once
+
+#include <cuvs/neighbors/ivf_rabitq/defines.hpp>
+#include <cuvs/neighbors/ivf_rabitq/utils/utils_cuda.cuh>
+
+#include <raft/core/device_mdarray.hpp>
+#include <raft/core/resource/cuda_stream.hpp>
+#include <raft/core/resources.hpp>
 
 #include <cstdint>
-#include <cuvs/neighbors/ivf_rabitq/defines.hpp>
 #include <fstream>
 #include <string>
 #include <vector>
-// #include "index/Quantizer.hpp"  // For ExFactor, etc.
-#include <cuvs/neighbors/ivf_rabitq/utils/utils_cuda.cuh>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 class InitializerGPU {
  public:
@@ -26,7 +31,10 @@ class InitializerGPU {
    * @param d dimension of vectors
    * @param k number of centroids
    */
-  explicit InitializerGPU(size_t d, size_t k) : D(d), K(k) {}
+  explicit InitializerGPU(raft::resources const& handle, size_t d, size_t k)
+    : D(d), K(k), handle_(handle), stream_(raft::resource::get_cuda_stream(handle_))
+  {
+  }
 
   virtual ~InitializerGPU() = default;
 
@@ -46,8 +54,6 @@ class InitializerGPU {
    */
   virtual void AddVectors(const float* cent) = 0;
 
-  virtual void AddVectorsD2D(const float* cent) = 0;
-
   /**
    * @brief Computes the distances from the query vector to each getCentroidbyId.
    *
@@ -59,8 +65,7 @@ class InitializerGPU {
   virtual void ComputeCentroidsDistances(const float* query,
                                          size_t nprobe,
                                          Candidate* candidates,
-                                         size_t num_candidates,
-                                         cudaStream_t stream) const = 0;
+                                         size_t num_candidates) const = 0;
 
   /**
    * @brief LoadCentroids centroids' information from files.
@@ -79,15 +84,15 @@ class InitializerGPU {
   virtual void SaveCentroids(std::ofstream& output, const char* filename) const = 0;
 
  protected:
-  size_t D;  // Dimension
-  size_t K;  // Num of Centroids
+  size_t D;                        // Dimension
+  size_t K;                        // Num of Centroids
+  raft::resources const& handle_;  // reusable resource handle
+  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
 };
 
 class FlatInitializerGPU : public InitializerGPU {
  public:
-  explicit FlatInitializerGPU(size_t d, size_t k);
-
-  ~FlatInitializerGPU() override;
+  explicit FlatInitializerGPU(raft::resources const& handle, size_t d, size_t k);
 
   [[nodiscard]] __host__ __device__ float* GetCentroid(PID id) const override;
 
@@ -96,8 +101,7 @@ class FlatInitializerGPU : public InitializerGPU {
   void ComputeCentroidsDistances(const float* query,
                                  size_t nprobe,
                                  Candidate* candidates,
-                                 size_t num_candidates,
-                                 cudaStream_t stream) const override;
+                                 size_t num_candidates) const override;
 
   void LoadCentroids(std::ifstream& input, const char* filename) override;
 
@@ -106,8 +110,6 @@ class FlatInitializerGPU : public InitializerGPU {
   __host__ __device__ float* GetCentroidTranspose(PID id) const;
 
   void AddVectorsTranspose(const float* cent);
-
-  void AddVectorsD2D(const float* cent);
 
   void ComputeCentroidsDistancesTranspose(const float* query,
                                           size_t nprobe,
@@ -121,13 +123,14 @@ class FlatInitializerGPU : public InitializerGPU {
  private:
   // D, K are inherited from parent
 
-  float* Centroids;  // Stored in GPU device memory. Points to the parent centroids' array (do we
-                     // really need a pointer?)
-  // For simplicity, we use a single distance function.
+  raft::device_matrix<float, int64_t, raft::row_major>
+    centroids_;  // Stored in GPU device memory. Points to the parent centroids' array
 
+  // For simplicity, we use a single distance function.
   float (*dist_func)(const float* __restrict__, const float* __restrict__, size_t);
 
-  [[nodiscard]] size_t data_bytes() const { return sizeof(float) * K * D; }
+  [[nodiscard]] size_t data_bytes() const noexcept { return sizeof(float) * K * D; }
+  [[nodiscard]] size_t data_elements() const noexcept { return K * D; }
 };
 
-#endif  // EXRABITQ_INITIALIZER_GPU_CUH
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

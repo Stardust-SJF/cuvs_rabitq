@@ -21,6 +21,8 @@
 
 namespace {
 
+using namespace cuvs::neighbors::ivf_rabitq::detail;
+
 // search parameters
 size_t TOPK          = 10;
 size_t ROUND         = 3;
@@ -76,7 +78,7 @@ int test_ivf_rabitq_construct_batch(raft::resources const& handle, int argc, cha
 
   // Construct the index (this function performs necessary host-to-device transfers internally).
   ivf.construct(
-    handle, data.data_handle(), centroids.data_handle(), cids.data_handle(), fast_quantize_flag);
+    data.data_handle(), centroids.data_handle(), cids.data_handle(), fast_quantize_flag);
 
   float minutes = stopw.getElapsedTimeMili() / 1000.0f / 60.0f;
   float seconds = stopw.getElapsedTimeMili() / 1000.0f;
@@ -213,7 +215,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
 
   StopW stopw;
   IVFGPU ivf(handle);
-  ivf.load_transposed(handle, ivf_file);
+  ivf.load_transposed(ivf_file);
 
   std::vector<size_t> all_nprobes;
   // ssss
@@ -247,10 +249,10 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
   size_t total_count = NQ * TOPK;
   //    StopW stopw;
 
-  FloatRowMat padded_query = raft::make_host_matrix<float, int64_t>(NQ, ivf.padded_dim());
+  FloatRowMat padded_query = raft::make_host_matrix<float, int64_t>(NQ, ivf.get_num_padded_dim());
   // padded_query.setZero();
-  memset(padded_query.data_handle(), 0, sizeof(float) * NQ * ivf.padded_dim());
-  FloatRowMat rotated_query = raft::make_host_matrix<float, int64_t>(NQ, ivf.padded_dim());
+  memset(padded_query.data_handle(), 0, sizeof(float) * NQ * ivf.get_num_padded_dim());
+  FloatRowMat rotated_query = raft::make_host_matrix<float, int64_t>(NQ, ivf.get_num_padded_dim());
   for (size_t i = 0; i < NQ; ++i) {
     std::memcpy(&padded_query(i, 0), &query(i, 0), sizeof(float) * DIM);
   }
@@ -258,29 +260,29 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
   // Allocate device memory for query vectors.
   float* d_query = nullptr;
   stopw.reset();
-  cudaMalloc(&d_query, NQ * ivf.padded_dim() * sizeof(float));
+  cudaMalloc(&d_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
 
   // Copy query vectors from host to device.
   cudaMemcpy(d_query,
              padded_query.data_handle(),
-             NQ * ivf.padded_dim() * sizeof(float),
+             NQ * ivf.get_num_padded_dim() * sizeof(float),
              cudaMemcpyHostToDevice);
 
   // Allocate device memory for rotated queries.
   float* d_rotated_query = nullptr;
-  cudaMalloc(&d_rotated_query, NQ * ivf.padded_dim() * sizeof(float));
+  cudaMalloc(&d_rotated_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
 
   // Now, use the RotatorGPU::rotate method to rotate the query vectors on GPU.
   // The RotatorGPU::rotate function is defined as:
   //    void RotatorGPU::rotate(const float* d_A, float* d_RAND_A, size_t N) const;
   // where d_A is the input matrix (N x padded_dim) and d_RAND_A is the output.
-  ivf.rotator().rotate(handle, d_query, d_rotated_query, NQ);
+  ivf.rotator().rotate(d_query, d_rotated_query, NQ);
 
   float rotate_time = stopw.getElapsedTimeMicro();
 
   // adjust nprobes
   for (auto it = all_nprobes.begin(); it != all_nprobes.end();) {
-    if (*it > ivf.num_clusters()) {
+    if (*it > ivf.get_num_centroids()) {
       it = all_nprobes.erase(it);
     } else {
       ++it;
@@ -293,21 +295,26 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
   std::vector<std::vector<float>> all_ratio(ROUND, std::vector<float>(length));
 
   // Create a GPU searcher instance (which uses the device query, etc.).
-  SearcherGPU searcher(
-    handle, &rotated_query(0, 0), ivf.padded_dim(), ivf.ex_bits, mode, rabitq_quantize_flag);
+  SearcherGPU searcher(handle,
+                       &rotated_query(0, 0),
+                       ivf.get_num_padded_dim(),
+                       ivf.get_ex_bits(),
+                       mode,
+                       rabitq_quantize_flag);
 
   // find the longest cluster to allocate space;
   int max_cluster_length     = 0;
   long int total_num_vectors = 0;
-  for (auto i : ivf.h_cluster_meta) {
-    total_num_vectors += i.num;
-    if (i.num > (unsigned int)max_cluster_length) { max_cluster_length = i.num; }
+  for (int64_t i = 0; i < ivf.get_cluster_meta_host().extent(0); ++i) {
+    total_num_vectors += ivf.get_cluster_meta_host()(i).num;
+    max_cluster_length =
+      max(max_cluster_length, static_cast<int>(ivf.get_cluster_meta_host()(i).num));
   }
   // TODO: this should be part of the load function
-  ivf.max_cluster_length = max_cluster_length;
+  ivf.set_max_cluster_length(max_cluster_length);
   std::cout << "max cluster length: " << max_cluster_length << std::endl;
 
-  searcher.AllocateSearcherSpace(ivf, NQ, TOPK, 3000, max_cluster_length, 0);
+  searcher.AllocateSearcherSpace(ivf, NQ, TOPK, 3000, max_cluster_length);
   //   bool multiple_cluster_search = true;
 
   // prepare CPU side data for offloading computation
@@ -315,8 +322,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
   //    searcher.h_est_dis = (float*)malloc(sizeof(float) * max_cluster_length);
   //    searcher.h_ip_results = (float*)malloc(sizeof(float) * max_cluster_length);
 
-  cudaStream_t single_stream = 0;
-  cudaStreamCreate(&single_stream);
+  cudaStream_t single_stream = raft::resource::get_cuda_stream(handle);
   // Create a device result pool. (k*nprobe for multiple use)
   for (size_t r = 0; r < ROUND; r++) {
     std::vector<int> probe_hist_global(all_nprobes[0], 0);  // only support length = 1
@@ -343,8 +349,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
                                d_topk_dists,
                                d_final_dists,
                                d_topk_pids,
-                               d_final_pids,
-                               single_stream);
+                               d_final_pids);
         cudaDeviceSynchronize();
         total_time += stopw.getElapsedTimeMicro();
         // time stop
@@ -359,8 +364,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
                                     d_topk_dists,
                                     d_final_dists,
                                     d_topk_pids,
-                                    d_final_pids,
-                                    single_stream);
+                                    d_final_pids);
         cudaDeviceSynchronize();
         total_time += stopw.getElapsedTimeMicro();
       } else if (searcher.mode == "quant8") {
@@ -374,8 +378,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
                                             d_final_dists,
                                             d_topk_pids,
                                             d_final_pids,
-                                            8,
-                                            single_stream);
+                                            8);
         cudaDeviceSynchronize();
         total_time += stopw.getElapsedTimeMicro();
       } else if (searcher.mode == "quant4") {
@@ -389,8 +392,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
                                             d_final_dists,
                                             d_topk_pids,
                                             d_final_pids,
-                                            4,
-                                            single_stream);
+                                            4);
         cudaDeviceSynchronize();
         total_time += stopw.getElapsedTimeMicro();
       }
@@ -497,7 +499,6 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
               << ratio << std::endl;
   }
 
-  cudaStreamDestroy(single_stream);
   return 0;
 }
 

@@ -7,39 +7,38 @@
 // Created by Stardust on 3/24/25.
 //
 
-#ifndef EXRABITQ_ROTATOR_GPU_CUH
-#define EXRABITQ_ROTATOR_GPU_CUH
+#pragma once
 
+#include <raft/core/device_mdarray.hpp>
+#include <raft/core/mdspan_types.hpp>
 #include <raft/core/resources.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <cstdint>
 #include <cuvs/neighbors/ivf_rabitq/defines.hpp>
 #include <cuvs/neighbors/ivf_rabitq/utils/utils_cuda.cuh>
 #include <fstream>
 
+namespace cuvs::neighbors::ivf_rabitq::detail {
+
 // The RotatorGPU class holds a rotation matrix (P) on the GPU. The matrix is computed
 // on the CPU (using Eigen, similar to your CPU code) and then copied to device memory.
 // The rotate() function uses cuBLAS to compute the product: RAND_A = A * P.
 // It is assumed that A and RAND_A reside in GPU memory.
 class RotatorGPU {
- private:
-  size_t D;               // Padded dimension
-  cudaStream_t m_stream;  // CUDA stream
- public:                  /**
-                           * @brief Construct a new RotatorGPU object.
-                           * @param dim The original dimension; the padded dimension D is computed as
-                           * rd_up_to_multiple_of(dim, 64).
-                           *
-                           * The constructor generates a random rotation matrix on the CPU (using Eigen) and then
-                           * copies it into                    device memory in column-major order.
-                           */
+ public: /**
+          * @brief Construct a new RotatorGPU object.
+          * @param dim The original dimension; the padded dimension D is computed as
+          * rd_up_to_multiple_of(dim, 64).
+          *
+          * The constructor generates a random rotation matrix on the CPU (using Eigen) and then
+          * copies it into                    device memory in column-major order.
+          */
   explicit RotatorGPU(raft::resources const& handle, uint32_t dim);
-  explicit RotatorGPU() {}
 
-  ~RotatorGPU();
-
-  // Assignment operator.
-  RotatorGPU& operator=(const RotatorGPU& other);
+  // Disable copy assignment
+  RotatorGPU& operator=(const RotatorGPU& other) = delete;
 
   size_t size() const;
 
@@ -54,6 +53,7 @@ class RotatorGPU {
 
   /**
    * @brief Save the rotation matrix to a file.
+   * @param handle Resource handle
    * @param output Output stream.
    *
    * The function copies the rotation matrix from device memory, transposes it from column-major to
@@ -64,9 +64,13 @@ class RotatorGPU {
   // Rotate matrix A and store the result in RAND_A.
   // A and RAND_A are device pointers representing matrices of size N x D.
   // This function computes: RAND_A = A * P using cuBLAS.
-  void rotate(raft::resources const& handle, const float* d_A, float* d_RAND_A, size_t N) const;
+  void rotate(const float* d_A, float* d_RAND_A, size_t N) const;
 
-  float* d_P;  // Device pointer for the rotation matrix (stored in row-major order)
+ private:
+  raft::resources const& handle_;  // reusable resource handle
+  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
+  size_t D;                        // Padded dimension
+  raft::device_matrix<float, int64_t, raft::row_major> rotation_matrix_;  // Rotation matrix P
 };
 
-#endif  // EXRABITQ_ROTATOR_GPU_CUH
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

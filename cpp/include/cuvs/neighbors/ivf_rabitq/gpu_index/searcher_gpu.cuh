@@ -7,12 +7,17 @@
 // Created by Stardust on 4/14/25.
 //
 
-#ifndef EXRABITQ_SEARCHER_GPU_CUH
-#define EXRABITQ_SEARCHER_GPU_CUH
+#pragma once
 
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/ivf_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/pool_gpu.cuh>
 #include <cuvs/neighbors/ivf_rabitq/gpu_index/quantizer_gpu.cuh>
+
+#include <raft/core/resources.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 struct Candidate3 {  // unchanged
   float dist;
@@ -117,8 +122,7 @@ class SearcherGPU {
                              size_t num_queries,
                              size_t k,
                              size_t max_nprobes,
-                             size_t max_cluster_length,
-                             cudaStream_t s);
+                             size_t max_cluster_length);
 
   /**
    * @brief Search one of the IVF Cluster
@@ -131,50 +135,43 @@ class SearcherGPU {
                      const typename IVFGPU::GPUClusterMeta& cur_cluster,
                      float sqr_y,
                      DeviceResultPool* KNNs,
-                     float* centroid_data,
-                     cudaStream_t s);
+                     float* centroid_data);
 
   void SearchClustershowingTime(const IVFGPU& cur_ivf,
                                 const IVFGPU::GPUClusterMeta& cur_cluster,
                                 float sqr_y,
                                 DeviceResultPool* KNNs,
-                                float* centroid_data,
-                                cudaStream_t stream);
+                                float* centroid_data);
 
   void SearchClusterWithFilter(const IVFGPU& cur_ivf,
                                const IVFGPU::GPUClusterMeta& cur_cluster,
                                float sqr_y,
                                DeviceResultPool* KNNs,
-                               float* centroid_data,
-                               cudaStream_t stream);
+                               float* centroid_data);
 
   void SearchClusterWithFilterMemOpt(const IVFGPU& cur_ivf,
                                      const IVFGPU::GPUClusterMeta& cur_cluster,
                                      float sqr_y,
                                      DeviceResultPool* KNNs,
-                                     float* centroid_data,
-                                     cudaStream_t stream);
+                                     float* centroid_data);
 
   void SearchClusterWithFilterMemOptOffload(const IVFGPU& cur_ivf,
                                             const IVFGPU::GPUClusterMeta& cur_cluster,
                                             float sqr_y,
                                             BoundedKNN* KNNs,
-                                            float* centroid_data,
-                                            cudaStream_t stream);
+                                            float* centroid_data);
 
   void SearchClusterWithFilterMemOptV2(const IVFGPU& cur_ivf,
                                        const IVFGPU::GPUClusterMeta& cur_cluster,
                                        float sqr_y,
                                        DeviceResultPool* KNNs,
-                                       float* centroid_data,
-                                       cudaStream_t stream);
+                                       float* centroid_data);
 
   void SearchMultipleClusters(const IVFGPU& cur_ivf,
                               IVFGPU::GPUClusterMeta* d_cluster_meta,
                               Candidate* d_centroid_candidates,
                               DeviceResultPool* KNNs,
                               float* d_centroid,
-                              cudaStream_t stream,
                               const float* h_query,
                               size_t nprobe);
 
@@ -182,15 +179,14 @@ class SearcherGPU {
                                                 const IVFGPU::GPUClusterMeta& cur_cluster,
                                                 float sqr_y,
                                                 DeviceResultPool* KNNs,
-                                                float* centroid_data,
-                                                cudaStream_t stream);
+                                                float* centroid_data);
 
   static SearcherGPU* CreateNewSearcherforStream(size_t d,
                                                  size_t ex_bits,
                                                  size_t num_clusters,
                                                  size_t num_vectors,
                                                  size_t k,
-                                                 cudaStream_t stream);
+                                                 rmm::cuda_stream_view stream);
 
   /**
    * @brief Function to Search <cluster_id, query_id> pairs
@@ -222,8 +218,7 @@ class SearcherGPU {
                                float* d_topk_dists,
                                PID* d_topk_pids,
                                float* d_final_dists,
-                               PID* d_final_pids,
-                               cudaStream_t stream);
+                               PID* d_final_pids);
 
   void SearchClusterQueryPairsPreComputeThreshold(const IVFGPU& cur_ivf,
                                                   IVFGPU::GPUClusterMeta* d_cluster_meta,
@@ -238,8 +233,7 @@ class SearcherGPU {
                                                   float* d_topk_dists,
                                                   PID* d_topk_pids,
                                                   float* d_final_dists,
-                                                  PID* d_final_pids,
-                                                  cudaStream_t stream);
+                                                  PID* d_final_pids);
 
   void SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
                                            IVFGPU::GPUClusterMeta* d_cluster_meta,
@@ -253,8 +247,7 @@ class SearcherGPU {
                                            float* d_topk_dists,
                                            PID* d_topk_pids,
                                            float* d_final_dists,
-                                           PID* d_final_pids,
-                                           cudaStream_t stream);
+                                           PID* d_final_pids);
 
   void SearchClusterQueryPairsQuantizeQuery(const IVFGPU& cur_ivf,
                                             IVFGPU::GPUClusterMeta* d_cluster_meta,
@@ -269,17 +262,18 @@ class SearcherGPU {
                                             PID* d_topk_pids,
                                             float* d_final_dists,
                                             PID* d_final_pids,
-                                            cudaStream_t stream,
                                             bool use_4bit = false);
 
  private:
+  raft::resources const& handle_;  // reusable resource handle
+  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
   //    float* uint_q = nullptr;
   void destroy() noexcept;
 
   /* ---------- tiny helpers ---------- */
-  static inline void safeCudaFree(void* p) noexcept
+  inline void safeCudaFreeAsync(void* p) noexcept
   {
-    if (p) cudaFree(p);  // ignore error in a noexcept dtor
+    if (p) RAFT_CUDA_TRY_NO_THROW(cudaFreeAsync(p, stream_));  // ignore error in a noexcept dtor
   }
   template <typename T>
   static inline void safeHostFree(T*& p) noexcept
@@ -295,8 +289,7 @@ class SearcherGPU {
                                                const IVFGPU::GPUClusterMeta& cur_cluster,
                                                float sqr_y,
                                                BoundedKNN* KNNs,
-                                               float* centroid_data,
-                                               cudaStream_t stream);
+                                               float* centroid_data);
 };
 
 // Launch this kernel with at least num_vector_cluster * 32 threads.
@@ -313,4 +306,4 @@ __global__ void compute_ip_kernel(const int16_t* quant_query_gpu,
                                   float qnorm,
                                   float one_over_sqrtD);
 
-#endif  // EXRABITQ_SEARCHER_GPU_CUH
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

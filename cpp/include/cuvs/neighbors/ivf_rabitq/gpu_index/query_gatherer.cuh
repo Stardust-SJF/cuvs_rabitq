@@ -7,13 +7,18 @@
 // Created by Stardust on 8/18/25.
 //
 
-#ifndef GBITQ_QUERY_GATHERER_CUH
-#define GBITQ_QUERY_GATHERER_CUH
+#pragma once
+
+#include <raft/core/resources.hpp>
+
+#include <rmm/cuda_stream_view.hpp>
 
 #include <algorithm>
 #include <cuda_runtime.h>
 #include <unordered_map>
 #include <vector>
+
+namespace cuvs::neighbors::ivf_rabitq::detail {
 
 class BatchedQueryGatherer {
   // private:
@@ -40,14 +45,15 @@ class BatchedQueryGatherer {
   int current_batch_clusters = 0;
   int start_cluster_idx      = 0;
 
-  // CUDA stream for async operations
-  cudaStream_t stream = nullptr;
+  // resource handle and CUDA stream
+  raft::resources const& handle_;  // reusable resource handle
+  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
 
   // Ctors / Dtor
-  BatchedQueryGatherer(int dim,
+  BatchedQueryGatherer(raft::resources const& handle,
+                       int dim,
                        int max_batch_size,
-                       int max_clusters          = 1000,
-                       cudaStream_t stream_input = nullptr);
+                       int max_clusters = 1000);
   ~BatchedQueryGatherer();
 
   // Batch control
@@ -129,4 +135,4 @@ class BatchedQueryGatherer {
   int get_current_batch_clusters() const { return current_batch_clusters; }
 };
 
-#endif  // GBITQ_QUERY_GATHERER_CUH
+}  // namespace cuvs::neighbors::ivf_rabitq::detail

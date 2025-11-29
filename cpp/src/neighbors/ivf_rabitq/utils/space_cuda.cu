@@ -5,6 +5,9 @@
 
 #include <cuvs/neighbors/ivf_rabitq/utils/space_cuda.cuh>
 
+#include <raft/core/resource/cuda_stream.hpp>
+#include <raft/util/cuda_rt_essentials.hpp>
+
 #include <algorithm>  // std::max, std::min, std::clamp
 #include <cmath>      // std::abs
 #include <cstdint>    // int16_t, int32_t
@@ -12,7 +15,9 @@
 #include <numeric>
 #include <vector>
 
-float L2SqrThrust(const float* h_x, const float* h_y, size_t N)
+namespace cuvs::neighbors::ivf_rabitq::detail {
+
+float L2SqrThrust(raft::resources const& handle, const float* h_x, const float* h_y, size_t N)
 {
   // Copy host data to device vectors
   thrust::device_vector<float> d_x(h_x, h_x + N);
@@ -24,12 +29,14 @@ float L2SqrThrust(const float* h_x, const float* h_y, size_t N)
   auto end   = thrust::make_zip_iterator(thrust::make_tuple(d_x.end(), d_y.end()));
 
   // Compute the L2 squared distance using transform_reduce
-  float result = thrust::transform_reduce(begin,
-                                          end,                   // Input range
-                                          L2Functor(),           // Unary operation
-                                          0.0f,                  // Initial value
-                                          thrust::plus<float>()  // Summation operation
-  );
+  float result =
+    thrust::transform_reduce(thrust::cuda::par.on(raft::resource::get_cuda_stream(handle)),
+                             begin,
+                             end,                   // Input range
+                             L2Functor(),           // Unary operation
+                             0.0f,                  // Initial value
+                             thrust::plus<float>()  // Summation operation
+    );
 
   return result;
 }
@@ -120,32 +127,33 @@ __global__ void l2sqr_main_kernel(const float* __restrict__ x,
 }
 
 // 主机函数封装
-float L2Sqr_CUDA(const float* x, const float* y, size_t L)
+float L2Sqr_CUDA(raft::resources const& handle, const float* x, const float* y, size_t L)
 {
-  cudaStream_t stream;
-  cudaStreamCreate(&stream);
+  cudaStream_t stream = raft::resource::get_cuda_stream(handle);
   float* d_output;
-  cudaMalloc(&d_output, sizeof(float));
-  cudaMemset(d_output, 0, sizeof(float));
+  RAFT_CUDA_TRY(cudaMallocAsync(&d_output, sizeof(float), stream));
+  RAFT_CUDA_TRY(cudaMemsetAsync(d_output, 0, sizeof(float), stream));
 
   // 计算主部分（16倍数部分）
   const size_t num16 = L - (L % 16);
   if (num16 > 0) {
     const int grid_size = (num16 + BLOCK_SIZE * 4 - 1) / (BLOCK_SIZE * 4);
     l2sqr_main_kernel<<<grid_size, BLOCK_SIZE, 0, stream>>>(x, y, d_output, num16);
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
   }
 
   // 处理尾部剩余元素
   if (L > num16) {
     const int tail_grid = (L - num16 + BLOCK_SIZE - 1) / BLOCK_SIZE;
     l2sqr_tail_kernel<<<tail_grid, BLOCK_SIZE, 0, stream>>>(x, y, d_output, num16, L);
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
   }
 
   // 回传结果
   float result;
-  cudaMemcpyAsync(&result, d_output, sizeof(float), cudaMemcpyDeviceToHost, stream);
-  cudaStreamSynchronize(stream);
-  cudaFree(d_output);
+  RAFT_CUDA_TRY(cudaMemcpyAsync(&result, d_output, sizeof(float), cudaMemcpyDeviceToHost, stream));
+  raft::resource::sync_stream(handle);
+  RAFT_CUDA_TRY(cudaFreeAsync(d_output, stream));
 
   return result;
 }
@@ -268,3 +276,5 @@ void high_acc_quantize16_scalar(int16_t* __restrict__ result,
     result[i] = static_cast<int16_t>(q32);
   }
 }
+
+}  // namespace cuvs::neighbors::ivf_rabitq::detail
