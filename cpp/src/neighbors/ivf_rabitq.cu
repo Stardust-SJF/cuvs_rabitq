@@ -16,6 +16,8 @@
 
 #include <raft/util/cudart_utils.hpp>
 
+#include "../cluster/kmeans_balanced_impl_fit_predict.cuh"
+
 namespace cuvs::neighbors::ivf_rabitq {
 
 namespace detail {
@@ -75,25 +77,20 @@ void build(raft::resources const& handle,
   // dim_ext]!
   rmm::device_uvector<float> cluster_centers_buf(params.n_lists * dim, stream, device_memory);
   auto cluster_centers      = cluster_centers_buf.data();
-  auto d_dataset_const_view = raft::make_const_mdspan(d_dataset_view);
   auto centers_view =
     raft::make_device_matrix_view<float, int64_t>(cluster_centers, params.n_lists, dim);
   cuvs::cluster::kmeans::balanced_params kmeans_params;
   kmeans_params.n_iters = params.kmeans_n_iters;
   kmeans_params.metric  = cuvs::distance::DistanceType::L2Expanded;
-  cuvs::cluster::kmeans_balanced::fit(
-    handle, kmeans_params, d_dataset_const_view, centers_view, utils::mapping<float>{});
   // find cluster labels for dataset vectors
   rmm::device_uvector<uint32_t> labels(n_rows, stream, big_memory_resource);
-  auto centers_const_view =
-    raft::make_device_matrix_view<const float, int64_t>(cluster_centers, params.n_lists, dim);
   auto labels_view = raft::make_device_vector_view<uint32_t, int64_t>(labels.data(), n_rows);
-  cuvs::cluster::kmeans_balanced::predict(handle,
+  cuvs::cluster::kmeans_balanced::fit_predict(handle,
                                           kmeans_params,
-                                          d_dataset_const_view,
-                                          centers_const_view,
-                                          labels_view,
-                                          utils::mapping<float>());
+                                          d_dataset_view,
+                                          centers_view,
+                                          labels_view
+                                          );
 
   // Call RaBitQ index construct
   index->rabitq_index().construct_on_gpu(dataset.data_handle(),

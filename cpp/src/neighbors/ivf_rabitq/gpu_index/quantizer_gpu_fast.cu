@@ -622,7 +622,7 @@ void DataQuantizerGPU::quantize_batch_opt(const float* d_data,
   // jamxia edit
   RAFT_CUDA_TRY(cudaFreeAsync(d_XP, stream_));
 
-  raft::resource::sync_stream(handle_);
+  // raft::resource::sync_stream(handle_);
 }
 
 constexpr std::array<float, 9> kTightStart = {

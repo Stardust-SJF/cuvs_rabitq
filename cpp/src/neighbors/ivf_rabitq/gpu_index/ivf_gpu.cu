@@ -700,14 +700,14 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
 
     // Create atomic counters initialized with offsets
     size_t* d_atomic_counters = nullptr;
-     RAFT_CUDA_TRY(cudaMalloc(&d_atomic_counters, num_centroids * sizeof(size_t)));
-     RAFT_CUDA_TRY(cudaMemcpy(d_atomic_counters, d_offsets, num_centroids * sizeof(size_t), cudaMemcpyDeviceToDevice));
+    RAFT_CUDA_TRY(cudaMalloc(&d_atomic_counters, num_centroids * sizeof(size_t)));
+    RAFT_CUDA_TRY(cudaMemcpy(d_atomic_counters, d_offsets, num_centroids * sizeof(size_t), cudaMemcpyDeviceToDevice));
 
     num_blocks = (num_vectors + block_size - 1) / block_size;
     scatter_pids_kernel<<<num_blocks, block_size, 0, stream_>>>(
             d_flat_pids, device_cluster_ids, d_offsets, d_atomic_counters, num_vectors);
 
-     RAFT_CUDA_TRY(cudaFreeAsync(d_atomic_counters, stream_));
+    RAFT_CUDA_TRY(cudaFreeAsync(d_atomic_counters, stream_));
 
     // -------------------------
     // 7. Copy cluster metadata back to host
@@ -737,7 +737,7 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
 #endif
 
         quantize_cluster(cp, device_data, cur_centroid, cur_rotated_c);
-        if (i % 100 == 0) printf("Cluster %zu quantization finished!\n", i);
+      // if (i % 100 == 0) printf("Cluster %zu quantization finished!\n", i);
     }
 
     // Add rotated centroids
