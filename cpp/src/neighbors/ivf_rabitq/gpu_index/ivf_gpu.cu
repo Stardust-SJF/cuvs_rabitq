@@ -726,6 +726,17 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
     float* d_rotated_centroids = nullptr;
     RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_rotated_centroids, num_centroids * num_padded_dim * sizeof(float), stream_));
 
+    // -------------------------
+    // 10.5 get max cluster length and allocate temporary buffer for quantization
+    // Do note that this update will disable the ability of quantization with multiple streams
+    // -------------------------
+    max_cluster_length = 0;
+    for (const auto& meta : h_cluster_meta) {
+      max_cluster_length = std::max(max_cluster_length, meta.num);
+    }
+    // std::cout << "Max cluster length: " << max_cluster_length << std::endl;
+    DQ->alloc_buffers(max_cluster_length);
+
     // Process clusters sequentially
     for (size_t i = 0; i < num_centroids; ++i) {
         const float* cur_centroid = device_centroids + i * num_dimensions;
@@ -745,6 +756,7 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
 
     // Clean up
     RAFT_CUDA_TRY(cudaFreeAsync(d_rotated_centroids, stream_));
+    DQ->free_buffers();
     raft::resource::sync_stream(handle_);
 
     std::cout << "IVFGPU construction completed.\n";
@@ -852,6 +864,16 @@ void IVFGPU::construct(const float* host_data,
     (void**)&d_rotated_centroids, num_centroids * num_padded_dim * sizeof(float), stream_));
 
   // -------------------------
+  // Get max cluster length and allocate temporary buffer for quantization
+  // Do note that this update will disable the ability of quantization with multiple streams
+  // -------------------------
+  max_cluster_length = 0;
+  for (const auto& meta : h_cluster_meta) {
+    max_cluster_length = std::max(max_cluster_length, meta.num);
+  }
+  DQ->alloc_buffers(max_cluster_length);
+
+  // -------------------------
   // For each cluster, perform quantization.
   // -------------------------
   // Process clusters sequentially on host (could be parallelized with caution).
@@ -867,7 +889,7 @@ void IVFGPU::construct(const float* host_data,
     std::cout << "cluster size:" << h_cluster_meta[i].num << std::endl;
 #endif
     quantize_cluster(cp, d_data, cur_centroid, cur_rotated_c);
-    if (i % 100 == 0) printf("Cluster %d quantization finished!\n", i);
+    // if (i % 100 == 0) printf("Cluster %d quantization finished!\n", i);
   }
 
   // After quantization, add the rotated centroids into the initializer.
@@ -877,6 +899,7 @@ void IVFGPU::construct(const float* host_data,
   RAFT_CUDA_TRY(cudaFreeAsync(d_data, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_centroid, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_rotated_centroids, stream_));
+  DQ->free_buffers();
   raft::resource::sync_stream(handle_);
 }
 

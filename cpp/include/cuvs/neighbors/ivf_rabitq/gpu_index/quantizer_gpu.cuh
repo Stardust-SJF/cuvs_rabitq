@@ -66,6 +66,12 @@ public:
   raft::resources const& handle_;  // reusable resource handle
   rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
 
+  // device temporary space to quantize a cluster
+  float* d_XP_norm = nullptr;
+  int* d_bin_XP = nullptr;
+  float* d_XP = nullptr;
+  float* d_X_and_C_pad = nullptr;
+
   // Private helper functions (to be implemented with GPU kernels eventually):
   //    void pack_binary(const int* /*int matrix*/, uint64_t* out, size_t index) const;
   //    void rabitq_factor(const float* data, const float* centroid,
@@ -152,6 +158,10 @@ public:
   void set_quantize_scaling_factors_by_value(float value) {
     const_scaling_factor = value;
   }
+
+  // functions to malloc/free temp buffers for gpu
+  void alloc_buffers(size_t num_points);
+  void free_buffers();
 
   /*!
    * @brief Quantize the input data.

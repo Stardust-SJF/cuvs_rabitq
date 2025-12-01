@@ -2665,5 +2665,43 @@ void DataQuantizerGPU::quantize_batch(const float* d_data,
   RAFT_CUDA_TRY(cudaEventDestroy(stop));
 #endif
 }
+  void DataQuantizerGPU::alloc_buffers(size_t num_points) {
+  const size_t size_norm = num_points * D * sizeof(float);
+  const size_t size_bin  = num_points * D * sizeof(int);
+  const size_t size_xp   = (num_points + 1) * D * sizeof(float);
+
+  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_XP_norm),
+                             size_norm, stream_));
+
+  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_bin_XP),
+                             size_bin, stream_));
+
+  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_XP),
+                             size_xp, stream_));
+
+  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_X_and_C_pad),
+                             size_xp, stream_));
+}
+
+  void DataQuantizerGPU::free_buffers() {
+  if (d_XP_norm) {
+    RAFT_CUDA_TRY(cudaFreeAsync(d_XP_norm, stream_));
+    d_XP_norm = nullptr;
+  }
+  if (d_bin_XP) {
+    RAFT_CUDA_TRY(cudaFreeAsync(d_bin_XP, stream_));
+    d_bin_XP = nullptr;
+  }
+  if (d_XP) {
+    RAFT_CUDA_TRY(cudaFreeAsync(d_XP, stream_));
+    d_XP = nullptr;
+  }
+  if (d_X_and_C_pad) {
+    RAFT_CUDA_TRY(cudaFreeAsync(d_X_and_C_pad, stream_));
+    d_XP = nullptr;
+  }
+}
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail
+
+
