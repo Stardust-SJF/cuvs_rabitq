@@ -5323,20 +5323,47 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   const int num_words = (cur_ivf.get_num_padded_dim() + 31) / 32;
 
   // Allocate memory for quantization
-  float* d_query_ranges;
-  float* d_widths;
-  int8_t* d_quantized_queries;
-  uint32_t* d_packed_queries;
+  size_t ranges_size        = num_queries * 2 * sizeof(float);
+  size_t widths_size        = num_queries * sizeof(float);
+  size_t quantized_size     = num_queries * cur_ivf.get_num_padded_dim() * sizeof(int8_t);
+  size_t packed_size        = num_queries * num_bits * num_words * sizeof(uint32_t);
+  size_t counters_size      = num_queries * sizeof(int);
+  size_t thresholds_size    = num_queries * sizeof(float);
 
-  size_t ranges_size    = num_queries * 2 * sizeof(float);
-  size_t widths_size    = num_queries * sizeof(float);
-  size_t quantized_size = num_queries * cur_ivf.get_num_padded_dim() * sizeof(int8_t);
-  size_t packed_size    = num_queries * num_bits * num_words * sizeof(uint32_t);
+  auto align4 = [](size_t x) {
+    return (x + 3) & ~size_t(3);
+  };
 
-  RAFT_CUDA_TRY(cudaMallocAsync(&d_query_ranges, ranges_size, stream_));
-  RAFT_CUDA_TRY(cudaMallocAsync(&d_widths, widths_size, stream_));
-  RAFT_CUDA_TRY(cudaMallocAsync(&d_quantized_queries, quantized_size, stream_));
-  RAFT_CUDA_TRY(cudaMallocAsync(&d_packed_queries, packed_size, stream_));
+  size_t workspace_size = 0;
+  workspace_size += align4(ranges_size);
+  workspace_size += align4(widths_size);
+  workspace_size += align4(quantized_size);
+  workspace_size += align4(packed_size);
+  workspace_size += align4(counters_size);
+  workspace_size += align4(thresholds_size);
+
+  uint8_t* d_workspace = nullptr;
+  RAFT_CUDA_TRY(cudaMallocAsync(&d_workspace, workspace_size, stream_));
+
+  uint8_t* ptr = d_workspace;
+
+  float*   d_query_ranges         = reinterpret_cast<float*>(ptr);
+  ptr += align4(ranges_size);
+
+  float*   d_widths               = reinterpret_cast<float*>(ptr);
+  ptr += align4(widths_size);
+
+  int8_t*  d_quantized_queries    = reinterpret_cast<int8_t*>(ptr);
+  ptr += align4(quantized_size);
+
+  uint32_t* d_packed_queries      = reinterpret_cast<uint32_t*>(ptr);
+  ptr += align4(packed_size);
+
+  int*     d_query_write_counters = reinterpret_cast<int*>(ptr);
+  ptr += align4(counters_size);
+
+  float*   d_topk_threshold_batch = reinterpret_cast<float*>(ptr);
+  ptr += align4(thresholds_size);
 
   if (rabitq_quantize_flag) {
     const int block_size = 256;
@@ -5412,12 +5439,9 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   initDistancesKernel<<<blocks, threads, 0, stream_>>>(d_topk_dists, total_elements);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-  int* d_query_write_counters;
-  RAFT_CUDA_TRY(cudaMallocAsync(&d_query_write_counters, num_queries * sizeof(int), stream_));
+
   RAFT_CUDA_TRY(cudaMemsetAsync(d_query_write_counters, 0, num_queries * sizeof(int), stream_));
 
-  float* d_topk_threshold_batch;
-  RAFT_CUDA_TRY(cudaMallocAsync(&d_topk_threshold_batch, sizeof(float) * num_queries, stream_));
   thrust::fill(thrust::cuda::par.on(stream_),
                d_topk_threshold_batch,
                d_topk_threshold_batch + num_queries,
@@ -5582,12 +5606,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                         /* sorted = */ false);
 
   // Cleanup
-  RAFT_CUDA_TRY(cudaFreeAsync(d_topk_threshold_batch, stream_));
-  RAFT_CUDA_TRY(cudaFreeAsync(d_query_ranges, stream_));
-  RAFT_CUDA_TRY(cudaFreeAsync(d_widths, stream_));
-  RAFT_CUDA_TRY(cudaFreeAsync(d_quantized_queries, stream_));
-  RAFT_CUDA_TRY(cudaFreeAsync(d_packed_queries, stream_));
-  RAFT_CUDA_TRY(cudaFreeAsync(d_query_write_counters, stream_));
+  RAFT_CUDA_TRY(cudaFreeAsync(d_workspace, stream_););
 
   raft::resource::sync_stream(handle_);
 }
