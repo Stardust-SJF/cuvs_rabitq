@@ -93,7 +93,7 @@ void build(raft::resources const& handle,
                                           );
 
   // Call RaBitQ index construct
-  index->rabitq_index().construct_on_gpu(dataset.data_handle(),
+  index->rabitq_index().construct_on_gpu(d_dataset_array.view().data_handle(),
                                 cluster_centers,
                                 labels_view.data_handle(),
                                 params.fast_quantize_flag);

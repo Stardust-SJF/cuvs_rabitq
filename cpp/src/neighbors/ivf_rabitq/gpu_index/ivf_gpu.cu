@@ -715,7 +715,7 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
     std::vector<GPUClusterMeta> h_cluster_meta(num_centroids);
     RAFT_CUDA_TRY(cudaMemcpyAsync(h_cluster_meta.data(), d_cluster_meta_temp,
                num_centroids * sizeof(GPUClusterMeta), cudaMemcpyDeviceToHost, stream_));
-
+    RAFT_CUDA_TRY(cudaStreamSynchronize(stream_));
     // Copy counts for AllocateDeviceMemory
 
     RAFT_CUDA_TRY(cudaFreeAsync(d_offsets, stream_));
