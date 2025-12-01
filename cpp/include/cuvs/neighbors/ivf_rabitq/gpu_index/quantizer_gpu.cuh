@@ -149,7 +149,7 @@ public:
   const FastQuantizeFactors* get_query_scaling_factor_addr() const { return &fast_quantize_factors;}
   FastQuantizeFactors* get_query_scaling_factor_write_buffer() { return &fast_quantize_factors;   }
   void set_query_scaling_factors(size_t dim) {
-    fast_quantize_factors.const_scaling_factor_4bit = get_const_scaling_factors_fully_gpu(dim, 3);
+    fast_quantize_factors.const_scaling_factor_4bit = get_const_scaling_factors(handle_, dim, 3);
     fast_quantize_factors.const_scaling_factor_8bit = get_const_scaling_factors_fully_gpu(dim, 7);
   }
   void set_quantize_scaling_factors() {
