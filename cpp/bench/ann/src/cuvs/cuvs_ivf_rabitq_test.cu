@@ -363,28 +363,6 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
     std::memcpy(&padded_query(i, 0), &query(i, 0), sizeof(float) * DIM);
   }
 
-  // Allocate device memory for query vectors.
-  float* d_query = nullptr;
-  stopw.reset();
-  cudaMalloc(&d_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
-
-  // Copy query vectors from host to device.
-  cudaMemcpy(d_query,
-             padded_query.data_handle(),
-             NQ * ivf.get_num_padded_dim() * sizeof(float),
-             cudaMemcpyHostToDevice);
-
-  // Allocate device memory for rotated queries.
-  float* d_rotated_query = nullptr;
-  cudaMalloc(&d_rotated_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
-
-  // Now, use the RotatorGPU::rotate method to rotate the query vectors on GPU.
-  // The RotatorGPU::rotate function is defined as:
-  //    void RotatorGPU::rotate(const float* d_A, float* d_RAND_A, size_t N) const;
-  // where d_A is the input matrix (N x padded_dim) and d_RAND_A is the output.
-  ivf.rotator().rotate(d_query, d_rotated_query, NQ);
-
-  float rotate_time = stopw.getElapsedTimeMicro();
 
   // adjust nprobes
   for (auto it = all_nprobes.begin(); it != all_nprobes.end();) {
@@ -402,7 +380,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
 
   // Create a GPU searcher instance (which uses the device query, etc.).
   SearcherGPU searcher(handle,
-                       &rotated_query(0, 0),
+                       nullptr,
                        ivf.get_num_padded_dim(),
                        ivf.get_ex_bits(),
                        mode,
@@ -446,8 +424,26 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
       cudaMallocAsync(&d_final_pids, NQ * TOPK * sizeof(PID), single_stream);
       cudaDeviceSynchronize();
 
+      stopw.reset();
+      // Allocate device memory for query vectors.
+      float* d_query = nullptr;
+      cudaMalloc(&d_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
+
+      // Copy query vectors from host to device.
+      cudaMemcpy(d_query,
+                 padded_query.data_handle(),
+                 NQ * ivf.get_num_padded_dim() * sizeof(float),
+                 cudaMemcpyHostToDevice);
+
+      // Allocate device memory for rotated queries.
+      float* d_rotated_query = nullptr;
+      cudaMalloc(&d_rotated_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
+
+      // Rotate query and set manually
+      ivf.rotator().rotate(d_query, d_rotated_query, NQ);
+      searcher.query = d_rotated_query;
+
       if (searcher.mode == "lut32") {
-        stopw.reset();
         ivf.BatchClusterSearch(d_rotated_query,
                                TOPK,
                                nprobe,
@@ -462,7 +458,6 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
         // time stop
       } else if (searcher.mode == "lut16") {
         // test v3 lut using fp16
-        stopw.reset();
         ivf.BatchClusterSearchLUT16(d_rotated_query,
                                     TOPK,
                                     nprobe,
@@ -475,7 +470,6 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
         cudaDeviceSynchronize();
         total_time += stopw.getElapsedTimeMicro();
       } else if (searcher.mode == "quant8") {
-        stopw.reset();
         ivf.BatchClusterSearchQuantizeQuery(d_rotated_query,
                                             TOPK,
                                             nprobe,
@@ -489,7 +483,6 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
         cudaDeviceSynchronize();
         total_time += stopw.getElapsedTimeMicro();
       } else if (searcher.mode == "quant4") {
-        stopw.reset();
         ivf.BatchClusterSearchQuantizeQuery(d_rotated_query,
                                             TOPK,
                                             nprobe,
@@ -559,7 +552,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
       cudaFreeAsync(d_topk_pids, single_stream);
       cudaFreeAsync(d_final_pids, single_stream);
 
-      float qps = NQ / ((total_time + rotate_time) / 1e6);
+      float qps = NQ / (total_time / 1e6);
 
       all_qps[r][i]    = qps;
       all_recall[r][i] = recall;
