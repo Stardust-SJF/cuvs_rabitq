@@ -427,17 +427,17 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
       stopw.reset();
       // Allocate device memory for query vectors.
       float* d_query = nullptr;
-      cudaMalloc(&d_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
+      cudaMallocAsync(&d_query, NQ * ivf.get_num_padded_dim() * sizeof(float) , single_stream);
 
       // Copy query vectors from host to device.
-      cudaMemcpy(d_query,
+      cudaMemcpyAsync(d_query,
                  padded_query.data_handle(),
                  NQ * ivf.get_num_padded_dim() * sizeof(float),
-                 cudaMemcpyHostToDevice);
+                 cudaMemcpyHostToDevice, single_stream);
 
       // Allocate device memory for rotated queries.
       float* d_rotated_query = nullptr;
-      cudaMalloc(&d_rotated_query, NQ * ivf.get_num_padded_dim() * sizeof(float));
+      cudaMallocAsync(&d_rotated_query, NQ * ivf.get_num_padded_dim() * sizeof(float), single_stream);
 
       // Rotate query and set manually
       ivf.rotator().rotate(d_query, d_rotated_query, NQ);
@@ -551,6 +551,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
       cudaFreeAsync(d_final_dists, single_stream);
       cudaFreeAsync(d_topk_pids, single_stream);
       cudaFreeAsync(d_final_pids, single_stream);
+      cudaFreeAsync(d_query,single_stream);
 
       float qps = NQ / (total_time / 1e6);
 
