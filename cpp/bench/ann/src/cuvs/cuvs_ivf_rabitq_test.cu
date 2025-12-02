@@ -601,6 +601,48 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
               << ratio << std::endl;
   }
 
+  // --- Find the first nprobe where recall crosses certain thresholds ---
+  struct ThresholdInfo {
+    float  threshold;
+    size_t nprobe;
+    float  recall;
+    float  qps;
+    bool   found;
+  };
+
+  std::vector<ThresholdInfo> thresholds = {
+    {0.90f, 0, 0.0f, 0.0f, false},
+    {0.95f, 0, 0.0f, 0.0f, false},
+    {0.99f, 0, 0.0f, 0.0f, false}
+  };
+
+  // For each threshold, find the earliest nprobe that meets recall >= threshold.
+  for (auto& t : thresholds) {
+    for (size_t i = 0; i < length; ++i) {
+      if (avg_recall[i] >= t.threshold) {
+        t.nprobe = all_nprobes[i];
+        t.recall = avg_recall[i];
+        t.qps    = avg_qps[i];
+        t.found  = true;
+        break;
+      }
+    }
+  }
+
+  std::cout << "\nRecall threshold summary (first nprobe reaching each level):\n";
+  for (auto const& t : thresholds) {
+    if (t.found) {
+      std::cout << "  recall >= " << t.threshold
+                << " at nprobe = " << t.nprobe
+                << "  (recall = " << std::fixed << std::setprecision(P_RECALL)
+                << t.recall << ", QPS = " << std::setprecision(P_QPS)
+                << t.qps << ")\n";
+    } else {
+      std::cout << "  recall >= " << t.threshold
+                << " was NOT reached for any nprobe.\n";
+    }
+  }
+
   return 0;
 }
 
