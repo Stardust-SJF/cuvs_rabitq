@@ -2666,41 +2666,19 @@ void DataQuantizerGPU::quantize_batch(const float* d_data,
 #endif
 }
   void DataQuantizerGPU::alloc_buffers(size_t num_points) {
-  const size_t size_norm = num_points * D * sizeof(float);
-  const size_t size_bin  = num_points * D * sizeof(int);
-  const size_t size_xp   = (num_points + 1) * D * sizeof(float);
 
-  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_XP_norm),
-                             size_norm, stream_));
+  const int64_t size_norm = static_cast<int64_t>(num_points) * D;
+  const int64_t size_bin  = static_cast<int64_t>(num_points) * D;
+  const int64_t size_xp   = static_cast<int64_t>(num_points + 1) * D;
 
-  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_bin_XP),
-                             size_bin, stream_));
+  // Overwrite RAFT device vectors with new allocations
+  d_XP_norm      = raft::make_device_vector<float, int64_t>(handle_, size_norm);
+  d_bin_XP       = raft::make_device_vector<int, int64_t>(handle_, size_bin);
+  d_XP           = raft::make_device_vector<float, int64_t>(handle_, size_xp);
+  d_X_and_C_pad  = raft::make_device_vector<float, int64_t>(handle_, size_xp);
 
-  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_XP),
-                             size_xp, stream_));
-
-  RAFT_CUDA_TRY(cudaMallocAsync(reinterpret_cast<void**>(&d_X_and_C_pad),
-                             size_xp, stream_));
 }
 
-  void DataQuantizerGPU::free_buffers() {
-  if (d_XP_norm) {
-    RAFT_CUDA_TRY(cudaFreeAsync(d_XP_norm, stream_));
-    d_XP_norm = nullptr;
-  }
-  if (d_bin_XP) {
-    RAFT_CUDA_TRY(cudaFreeAsync(d_bin_XP, stream_));
-    d_bin_XP = nullptr;
-  }
-  if (d_XP) {
-    RAFT_CUDA_TRY(cudaFreeAsync(d_XP, stream_));
-    d_XP = nullptr;
-  }
-  if (d_X_and_C_pad) {
-    RAFT_CUDA_TRY(cudaFreeAsync(d_X_and_C_pad, stream_));
-    d_XP = nullptr;
-  }
-}
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail
 

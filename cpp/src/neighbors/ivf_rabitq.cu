@@ -143,7 +143,7 @@ void search(raft::resources const& handle,
                                padded_dim,
                                idx.rabitq_index().get_ex_bits(),
                                search_mode_to_string(params.mode),
-                               idx.rabitq_index().quantizer().get_query_scaling_factor_write_buffer(),
+                               idx.rabitq_index().quantizer().get_query_scaling_factor_write_unsafe(),
                                /* rabitq_quantize_flag = */ true);
 
   // find the longest cluster to allocate space

@@ -162,7 +162,7 @@ void IVFGPU::load(const char* filename, bool load_batch_flag)
 
   // Initialize quantizer and rotator (host objects that drive GPU routines).
   this->DQ   = std::make_unique<DataQuantizerGPU>(handle_, num_dimensions, ex_bits, batch_flag);
-  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor_write_buffer()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
+  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor_write_unsafe()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
   this->Rota = std::make_unique<RotatorGPU>(handle_, num_dimensions);
   // Load cluster sizes.
   std::vector<size_t> cluster_sizes(num_centroids, 0);
@@ -242,7 +242,7 @@ void IVFGPU::load_transposed(const char* filename)
 
   // Initialize quantizer and rotator (host objects that drive GPU routines).
   this->DQ   = std::make_unique<DataQuantizerGPU>(handle_, num_dimensions, ex_bits, batch_flag);
-  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor_write_buffer()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
+  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor_write_unsafe()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
   this->Rota = std::make_unique<RotatorGPU>(handle_, num_dimensions);
   // Load cluster sizes.
   std::vector<size_t> cluster_sizes(num_centroids, 0);
@@ -461,7 +461,7 @@ void IVFGPU::save(const char* filename, bool save_batch_flag) const
   output.write(reinterpret_cast<const char*>(&num_centroids), sizeof(size_t));
   output.write(reinterpret_cast<const char*>(&ex_bits), sizeof(size_t));
   if (save_batch_flag) output.write(reinterpret_cast<const char*>(&batch_flag), sizeof(bool));
-  output.write(reinterpret_cast<const char*>(DQ->get_query_scaling_factor_addr()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
+  output.write(reinterpret_cast<const char*>(DQ->get_query_scaling_factor()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
 
   // Save number of vectors of each cluster.
   std::vector<GPUClusterMeta> h_cluster_meta(num_centroids);
@@ -584,22 +584,22 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
     DQ->fast_quantize_flag = fast_quantize;
 
     // pre-compute rescaling factors for search
-    DQ->set_query_scaling_factors(this->num_padded_dim);
+    DQ->compute_query_scaling_factors(this->num_padded_dim);
 
     // compute rescaling factors for query if neeeded
     if (DQ->fast_quantize_flag) {
-        DQ->set_quantize_scaling_factors();
+        DQ->compute_quantize_scaling_factors();
     }
 
     if (DQ->fast_quantize_flag) {
         if (ex_bits == 3) {
-            DQ->set_quantize_scaling_factors_by_value(DQ->get_query_scaling_factor_addr()->const_scaling_factor_4bit);
+            DQ->set_quantize_scaling_factors(DQ->get_query_scaling_factor()->const_scaling_factor_4bit);
         }
         else if (ex_bits == 7) {
-            DQ->set_quantize_scaling_factors_by_value(DQ->get_query_scaling_factor_addr()->const_scaling_factor_8bit);
+            DQ->set_quantize_scaling_factors(DQ->get_query_scaling_factor()->const_scaling_factor_8bit);
         }
         else {
-            DQ->set_quantize_scaling_factors();
+            DQ->compute_quantize_scaling_factors();
         }
     }
 
@@ -700,8 +700,8 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
 
     // Create atomic counters initialized with offsets
     size_t* d_atomic_counters = nullptr;
-    RAFT_CUDA_TRY(cudaMalloc(&d_atomic_counters, num_centroids * sizeof(size_t)));
-    RAFT_CUDA_TRY(cudaMemcpy(d_atomic_counters, d_offsets, num_centroids * sizeof(size_t), cudaMemcpyDeviceToDevice));
+    RAFT_CUDA_TRY(cudaMallocAsync(&d_atomic_counters, num_centroids * sizeof(size_t),stream_));
+    RAFT_CUDA_TRY(cudaMemcpyAsync(d_atomic_counters, d_offsets, num_centroids * sizeof(size_t), cudaMemcpyDeviceToDevice, stream_));
 
     num_blocks = (num_vectors + block_size - 1) / block_size;
     scatter_pids_kernel<<<num_blocks, block_size, 0, stream_>>>(
@@ -756,7 +756,6 @@ void IVFGPU::construct_on_gpu(const float* device_data, const float* device_cent
 
     // Clean up
     RAFT_CUDA_TRY(cudaFreeAsync(d_rotated_centroids, stream_));
-    DQ->free_buffers();
     raft::resource::sync_stream(handle_);
 
     std::cout << "IVFGPU construction completed.\n";
@@ -772,22 +771,22 @@ void IVFGPU::construct(const float* host_data,
   DQ->fast_quantize_flag = fast_quantize;
 
   // pre-compute rescaling factors for search
-  DQ->set_query_scaling_factors(this->num_padded_dim);
+  DQ->compute_query_scaling_factors(this->num_padded_dim);
 
   // compute rescaling factors for query if neeeded
   if (DQ->fast_quantize_flag) {
-    DQ->set_quantize_scaling_factors();
+    DQ->compute_quantize_scaling_factors();
   }
 
   if (DQ->fast_quantize_flag) {
     if (ex_bits == 3) {
-      DQ->set_quantize_scaling_factors_by_value(DQ->get_query_scaling_factor_addr()->const_scaling_factor_4bit);
+      DQ->set_quantize_scaling_factors(DQ->get_query_scaling_factor()->const_scaling_factor_4bit);
     }
     else if (ex_bits == 7) {
-      DQ->set_quantize_scaling_factors_by_value(DQ->get_query_scaling_factor_addr()->const_scaling_factor_8bit);
+      DQ->set_quantize_scaling_factors(DQ->get_query_scaling_factor()->const_scaling_factor_8bit);
     }
     else {
-      DQ->set_quantize_scaling_factors();
+      DQ->compute_quantize_scaling_factors();
     }
   }
 
@@ -899,7 +898,6 @@ void IVFGPU::construct(const float* host_data,
   RAFT_CUDA_TRY(cudaFreeAsync(d_data, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_centroid, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_rotated_centroids, stream_));
-  DQ->free_buffers();
   raft::resource::sync_stream(handle_);
 }
 

@@ -67,12 +67,12 @@ public:
   rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
 
   // device temporary space to quantize a cluster
-  float* d_XP_norm = nullptr;
-  int* d_bin_XP = nullptr;
-  float* d_XP = nullptr;
-  float* d_X_and_C_pad = nullptr;
+  raft::device_vector<float, int64_t>  d_XP_norm = raft::make_device_vector<float, int64_t>(handle_, 0);
+  raft::device_vector<int, int64_t> d_bin_XP = raft::make_device_vector<int, int64_t>(handle_, 0);
+  raft::device_vector<float, int64_t> d_XP = raft::make_device_vector<float, int64_t>(handle_, 0);
+  raft::device_vector<float, int64_t> d_X_and_C_pad = raft::make_device_vector<float, int64_t>(handle_, 0);
 
-  // Private helper functions (to be implemented with GPU kernels eventually):
+  // Private helper fu nctions (to be implemented with GPU kernels eventually):
   //    void pack_binary(const int* /*int matrix*/, uint64_t* out, size_t index) const;
   //    void rabitq_factor(const float* data, const float* centroid,
   //                       const std::vector<PID>& pids,
@@ -146,22 +146,21 @@ public:
   }  // May be useless
   size_t num_blocks(size_t num) const { return div_rd_up_new(num, FAST_SIZE); }
   static constexpr size_t num_short_factors() { return NUM_SHORT_FACTORS; }
-  const FastQuantizeFactors* get_query_scaling_factor_addr() const { return &fast_quantize_factors;}
-  FastQuantizeFactors* get_query_scaling_factor_write_buffer() { return &fast_quantize_factors;   }
-  void set_query_scaling_factors(size_t dim) {
+  const FastQuantizeFactors* get_query_scaling_factor() const { return &fast_quantize_factors;}
+  FastQuantizeFactors* get_query_scaling_factor_write_unsafe() { return &fast_quantize_factors;   }
+  void compute_query_scaling_factors(size_t dim) {
     fast_quantize_factors.const_scaling_factor_4bit = get_const_scaling_factors(handle_, dim, 3);
     fast_quantize_factors.const_scaling_factor_8bit = get_const_scaling_factors_fully_gpu(dim, 7);
   }
-  void set_quantize_scaling_factors() {
+  void compute_quantize_scaling_factors() {
     const_scaling_factor = get_const_scaling_factors_fully_gpu(D, EX_BITS);
   }
-  void set_quantize_scaling_factors_by_value(float value) {
+  void set_quantize_scaling_factors(float value) {
     const_scaling_factor = value;
   }
 
-  // functions to malloc/free temp buffers for gpu
+  // functions to malloc temp buffers for gpu
   void alloc_buffers(size_t num_points);
-  void free_buffers();
 
   /*!
    * @brief Quantize the input data.
@@ -223,7 +222,7 @@ public:
                           float* short_data_factors,
                           uint8_t* d_long_code,
                           float* d_ex_factor,
-                          float* d_rotated_c) const;
+                          float* d_rotated_c);
 
   /*!
    * @brief Get pointer of factors for the current block.
@@ -301,7 +300,7 @@ public:
                                      float* d_rotated_c,
                                      float* d_XP_norm,
                                      int* d_bin_XP,
-                                     float* d_XP) const;
+                                     float* d_XP);
 
   void exrabitq_codes_hybrid_advanced(const int* d_bin_XP,
                                       const float* d_XP_norm,

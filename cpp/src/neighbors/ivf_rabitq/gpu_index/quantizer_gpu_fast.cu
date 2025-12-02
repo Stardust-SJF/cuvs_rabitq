@@ -445,19 +445,19 @@ void DataQuantizerGPU::data_transformation_batch_opt(
   float* d_XP_norm,
   int* d_bin_XP,
   float* d_XP_output  // XP_output is (num_points + 1) * D to store extra centroid
-) const
+)
 {
   // 1. Allocate a single temporary buffer for both padded data and the padded centroid.
 
   // Create a pointer to the start of the centroid section for the kernel.
-  float* d_C_pad_ptr = d_X_and_C_pad + num_points * D;
+  float* d_C_pad_ptr = d_X_and_C_pad.data_handle() + num_points * D;
 
   // 2. Launch a single kernel to gather and pad both data and centroid.
   int blockSize = D < 256 ? 128 : 256;
   size_t totalPadElements = (num_points + 1) * D;
   int gridPadSize         = (totalPadElements + blockSize - 1) / blockSize;
   gatherAndPadKernel<<<gridPadSize, blockSize, 0, stream_>>>(
-    d_data, d_IDs, d_centroid, d_X_and_C_pad, num_points, DIM, D);
+    d_data, d_IDs, d_centroid, d_X_and_C_pad.data_handle(), num_points, DIM, D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   // 3. Allocate a single output buffer for both rotated data (XP) and rotated centroid (CP).
@@ -465,7 +465,7 @@ void DataQuantizerGPU::data_transformation_batch_opt(
 
   // 4. Perform a single, combined rotation.
   // The input is d_X_and_C_pad, output is d_XP_and_CP. The number of "points" is num_points + 1.
-  rotator.rotate(d_X_and_C_pad, d_XP_and_CP, num_points + 1);
+  rotator.rotate(d_X_and_C_pad.data_handle(), d_XP_and_CP, num_points + 1);
 
   // Create pointers to the specific results within the combined buffer.
   float* d_XP = d_XP_and_CP;
@@ -563,14 +563,14 @@ void DataQuantizerGPU::quantize_batch_opt(const float* d_data,
                                           float* d_short_data_factors,
                                           uint8_t* d_long_code,
                                           float* d_ex_factor,
-                                          float* d_rotated_c) const
+                                          float* d_rotated_c)
 {
 #ifdef DEBUG_BATCH_CONSTRUCT
 //    printf("Scaling factor: %f\n", const_scaling_factor);
 #endif
   // 1. Data Transformation:
   data_transformation_batch_opt(
-    d_data, d_centroid, d_IDs, num_points, rotator, d_rotated_c, d_XP_norm, d_bin_XP, d_XP);
+    d_data, d_centroid, d_IDs, num_points, rotator, d_rotated_c, d_XP_norm.data_handle(), d_bin_XP.data_handle(), d_XP.data_handle());
 
 #ifdef DEBUG_BATCH_CONSTRUCT
 //    if (debug_first_cluster_count_2 == 0) {
@@ -586,15 +586,15 @@ void DataQuantizerGPU::quantize_batch_opt(const float* d_data,
 //    }
 #endif
   rabitq_codes_and_factors_fused(
-    d_rotated_c, d_bin_XP, d_XP, d_short_data, d_short_data_factors, num_points);
+    d_rotated_c, d_bin_XP.data_handle(), d_XP.data_handle(), d_short_data, d_short_data_factors, num_points);
 
   // 5. Compute ExRaBitQ quantization codes.
   if (fast_quantize_flag) {
     exrabitq_codes_and_factors_fused(
-      d_bin_XP, d_XP_norm, d_XP, d_long_code, d_ex_factor, d_rotated_c, num_points);
+      d_bin_XP.data_handle(), d_XP_norm.data_handle(), d_XP.data_handle(), d_long_code, d_ex_factor, d_rotated_c, num_points);
   } else {
     exrabitq_codes_and_factors_fused_ori(
-      d_bin_XP, d_XP_norm, d_XP, d_long_code, d_ex_factor, d_rotated_c, num_points);
+      d_bin_XP.data_handle(), d_XP_norm.data_handle(), d_XP.data_handle(), d_long_code, d_ex_factor, d_rotated_c, num_points);
   }
 }
 
