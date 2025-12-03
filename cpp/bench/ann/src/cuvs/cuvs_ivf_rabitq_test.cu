@@ -441,7 +441,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
 
       // Rotate query and set manually
       ivf.rotator().rotate(d_query, d_rotated_query, NQ);
-      searcher.query = d_rotated_query;
+      searcher.set_query(d_rotated_query);
 
       if (searcher.get_mode() == "lut32") {
         ivf.BatchClusterSearch(d_rotated_query,
