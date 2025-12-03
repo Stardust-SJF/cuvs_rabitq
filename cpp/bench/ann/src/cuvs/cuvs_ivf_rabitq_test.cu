@@ -384,7 +384,7 @@ int test_ivf_rabitq_search_batch(raft::resources const& handle, int argc, char* 
                        ivf.get_num_padded_dim(),
                        ivf.get_ex_bits(),
                        mode,
-                       ivf.quantizer().get_query_scaling_factor_write_unsafe(),
+                       ivf.quantizer().get_query_scaling_factor(),
                        rabitq_quantize_flag);
 
   // find the longest cluster to allocate space;

@@ -162,7 +162,7 @@ void IVFGPU::load(const char* filename, bool load_batch_flag)
 
   // Initialize quantizer and rotator (host objects that drive GPU routines).
   this->DQ   = std::make_unique<DataQuantizerGPU>(handle_, num_dimensions, ex_bits, batch_flag);
-  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor_write_unsafe()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
+  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
   this->Rota = std::make_unique<RotatorGPU>(handle_, num_dimensions);
   // Load cluster sizes.
   std::vector<size_t> cluster_sizes(num_centroids, 0);
@@ -242,7 +242,7 @@ void IVFGPU::load_transposed(const char* filename)
 
   // Initialize quantizer and rotator (host objects that drive GPU routines).
   this->DQ   = std::make_unique<DataQuantizerGPU>(handle_, num_dimensions, ex_bits, batch_flag);
-  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor_write_unsafe()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
+  input.read(reinterpret_cast<char*>(this->DQ->get_query_scaling_factor()), sizeof(DataQuantizerGPU::FastQuantizeFactors));
   this->Rota = std::make_unique<RotatorGPU>(handle_, num_dimensions);
   // Load cluster sizes.
   std::vector<size_t> cluster_sizes(num_centroids, 0);

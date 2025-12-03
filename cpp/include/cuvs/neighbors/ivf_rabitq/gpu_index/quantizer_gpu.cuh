@@ -72,7 +72,7 @@ public:
   raft::device_vector<float, int64_t> d_XP = raft::make_device_vector<float, int64_t>(handle_, 0);
   raft::device_vector<float, int64_t> d_X_and_C_pad = raft::make_device_vector<float, int64_t>(handle_, 0);
 
-  // Private helper fu nctions (to be implemented with GPU kernels eventually):
+  // Private helper functions (to be implemented with GPU kernels eventually):
   //    void pack_binary(const int* /*int matrix*/, uint64_t* out, size_t index) const;
   //    void rabitq_factor(const float* data, const float* centroid,
   //                       const std::vector<PID>& pids,
@@ -147,7 +147,7 @@ public:
   size_t num_blocks(size_t num) const { return div_rd_up_new(num, FAST_SIZE); }
   static constexpr size_t num_short_factors() { return NUM_SHORT_FACTORS; }
   const FastQuantizeFactors* get_query_scaling_factor() const { return &fast_quantize_factors;}
-  FastQuantizeFactors* get_query_scaling_factor_write_unsafe() { return &fast_quantize_factors;   }
+  FastQuantizeFactors* get_query_scaling_factor() { return &fast_quantize_factors;   }
   void compute_query_scaling_factors(size_t dim) {
     fast_quantize_factors.const_scaling_factor_4bit = get_const_scaling_factors(handle_, dim, 3);
     fast_quantize_factors.const_scaling_factor_8bit = get_const_scaling_factors_fully_gpu(dim, 7);
