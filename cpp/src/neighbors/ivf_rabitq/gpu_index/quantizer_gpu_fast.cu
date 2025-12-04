@@ -7,7 +7,9 @@
 // Created by Stardust on 10/8/25.
 //
 
-#include <cuvs/neighbors/ivf_rabitq/gpu_index/quantizer_gpu.cuh>
+#include "quantizer_gpu.cuh"
+
+#include <curand_kernel.h>
 
 #include <curand_kernel.h>
 
