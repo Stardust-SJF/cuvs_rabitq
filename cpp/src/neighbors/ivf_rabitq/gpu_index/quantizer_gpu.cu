@@ -18,38 +18,6 @@ namespace cuvs::neighbors::ivf_rabitq::detail {
 
 #define MAX_D 2048
 
-////---------------------------------------------------------------------------
-//// Kernel: pack_binary_kernel
-////
-//// For each data point (row) and for each block of 64 bits,
-//// this kernel packs 64 0/1 int values into one uint64_t.
-//// Input:
-////    d_bin_XP: pointer to an int array of size (num_points x D)
-////              (stored in row-major order)
-//// Output:
-////    d_binary: pointer to an array of uint64_t values of length num_points * (D/64)
-////---------------------------------------------------------------------------
-//__global__ void pack_binary_kernel(const int* __restrict__ d_bin_XP,
-//                                   uint64_t* d_binary,
-//                                   size_t num_points,
-//                                   size_t D) {
-//    // Each block is responsible for one data point (row).
-//    size_t row = blockIdx.x;
-//    // Each thread in the block processes one block of 64 bits.
-//    size_t block_id = threadIdx.x; // range: 0 to (D/64 - 1)
-//    if (row < num_points && block_id < D / 64) {
-//        uint64_t cur = 0;
-//        // Process 64 bits.
-//        for (int i = 0; i < 64; i++) {
-//            // Read bit from row 'row' at column (block_id*64 + i)
-//            int bit = d_bin_XP[row * D + block_id * 64 + i];
-//            cur |= ((uint64_t)bit << (63 - i));
-//        }
-//        // Write the packed uint64_t value.
-//        d_binary[row * (D / 64) + block_id] = cur;
-//    }
-//}
-
 //---------------------------------------------------------------------------
 // Kernel: pack_binary_kernel
 //
@@ -126,11 +94,6 @@ void DataQuantizerGPU::rabitq_codes(const int* d_bin_XP,
 {
   // Number of uint32_t values per data point.
   size_t blocks_per_point = D / 32;
-  size_t total_uint64     = num_points * blocks_per_point;
-
-  // Allocate device memory for the intermediate binary representation.
-  //    uint64_t* d_binary;
-  //    RAFT_CUDA_TRY(cudaMalloc((void**)&d_binary, total_uint64 * sizeof(uint64_t)));
 
   // Launch kernel: one block per data point, each with (D/64) threads.
   dim3 grid(num_points);
@@ -138,16 +101,6 @@ void DataQuantizerGPU::rabitq_codes(const int* d_bin_XP,
   pack_binary_kernel<<<grid, block, 0, stream_>>>(d_bin_XP, d_packed_code, num_points, D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-  // Launch kernel to pack the binary codes into 8-bit packed codes.
-  //    // Here, we assume a simple scheme where each uint64_t is converted to 8 bytes.
-  int threads  = 256;
-  int gridSize = (total_uint64 + threads - 1) / threads;
-  //    pack_codes_kernel<<<gridSize, threads>>>(D, d_binary, num_points, d_packed_code);
-  // RAFT_CUDA_TRY(cudaGetLastError());
-  // RAFT_CUDA_TRY(cudaDeviceSynchronize());
-
-  // Free the intermediate binary array.
-  //    cudaFree(d_binary);
   raft::resource::sync_stream(handle_);
 }
 
@@ -250,77 +203,6 @@ __global__ void binarizeKernel(const float* __restrict__ d_XP,
   int idx = blockIdx.x * blockDim.x + threadIdx.x;
   if (idx < num_points * D) { d_bin_XP[idx] = (d_XP[idx] > 0.0f) ? 1 : 0; }
 }
-
-//__global__ void gatherKernel(const float* __restrict__ d_data,
-//                             const PID*   __restrict__ d_IDs,
-//                             float*       __restrict__ d_X_pad,
-//                             size_t N, uint32_t DIM, uint32_t D) {
-//    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-//    if (idx >= N) return;
-//    const float* src = d_data + static_cast<size_t>(d_IDs[idx]) * DIM;
-//    float* dst = d_X_pad + idx * D;
-//    // copy DIM floats (could be optimized via vectorized loads)
-//    for (uint32_t k = 0; k < DIM; ++k) dst[k] = src[k];
-//    // pad zeros automatically thanks to cudaMalloc initial value? we must pad manually
-//    for (uint32_t k = DIM; k < D; ++k) dst[k] = 0.0f;
-//}
-//
-//__global__ void copyCentroidKernel(const float* __restrict__ d_centroid,
-//                                   float*       __restrict__ d_C_pad,
-//                                   uint32_t DIM, uint32_t D) {
-//    uint32_t k = blockIdx.x * blockDim.x + threadIdx.x;
-//    if (k < DIM)  d_C_pad[k] = d_centroid[k];
-//    else if (k < D) d_C_pad[k] = 0.f;
-//}
-//
-//__global__ void subtractKernel(float* __restrict__ d_XP,
-//                               const float* __restrict__ d_CP,
-//                               size_t N, uint32_t D) {
-//    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-//    if (idx >= N*D) return;
-//    uint32_t col = idx % D;
-//    d_XP[idx] -= d_CP[col];
-//}
-//
-//__device__ __forceinline__ float wreduce_sum(float v) {
-//    // warp‑level reduction (assumes 32‑thread warp)
-//    for (int offset = 16; offset > 0; offset >>= 1)
-//        v += __shfl_down_sync(0xffffffff, v, offset);
-//    return v;
-//}
-//
-//__global__ void normalizeKernel(const float* __restrict__ d_in,
-//                                float*       __restrict__ d_out,
-//                                size_t N, uint32_t D) {
-//    // one warp handles one vector row for simplicity
-//    const uint32_t warpId = (blockIdx.x * blockDim.x + threadIdx.x) >> 5; // /32
-//    if (warpId >= N) return;
-//    const uint32_t lane = threadIdx.x & 31;
-//    const float* src = d_in + warpId * D;
-//    float* dst = d_out + warpId * D;
-//
-//    // compute squared norm
-//    float local = 0.f;
-//    for (uint32_t k = lane; k < D; k += 32) {
-//        float val = src[k];
-//        local += val * val;
-//    }
-//    float norm2 = wreduce_sum(local);
-//    float inv_norm = rsqrtf(norm2 + 1e-12f);
-//
-//    // write normalized values
-//    for (uint32_t k = lane; k < D; k += 32) {
-//        dst[k] = src[k] * inv_norm;
-//    }
-//}
-//
-//__global__ void binarizeKernel(const float* __restrict__ d_in,
-//                               int*         __restrict__ d_out,
-//                               size_t N, uint32_t D) {
-//    size_t idx = blockIdx.x * blockDim.x + threadIdx.x;
-//    if (idx >= N*D) return;
-//    d_out[idx] = d_in[idx] > 0.f;
-//}
 
 //---------------------------------------------------------------------------
 // DataQuantizerGPU::data_transformation (GPU version)
@@ -472,72 +354,6 @@ void DataQuantizerGPU::data_transformation_batch(const float* d_data,
 
   raft::resource::sync_stream(handle_);
 }
-
-// void DataQuantizerGPU::data_transformation(const float* d_data,
-//                          const float* d_centroid,
-//                          const PID* d_IDs,
-//                          size_t N,
-//                          const RotatorGPU& rotator,
-//                          float* d_rotated_c,
-//                          float* d_XP_norm,
-//                          int* d_bin_XP) const {
-//     const int block = 256;
-//     const int gridN = (N + block - 1)/block;
-//     const int gridD = (D + block - 1)/block;
-//     const int gridND= (N*D + block - 1)/block;
-//
-//     // 1) gather
-//     float* d_X_pad; RAFT_CUDA_TRY(cudaMalloc(&d_X_pad, N*D*sizeof(float)));
-//     gatherKernel<<<gridN, block>>>(d_data, d_IDs, d_X_pad, N, DIM, D);
-//     RAFT_CUDA_TRY(cudaGetLastError());
-//
-//     // 2) centroid pad
-//     float* d_C_pad; RAFT_CUDA_TRY(cudaMalloc(&d_C_pad, D*sizeof(float)));
-//     copyCentroidKernel<<<gridD, block>>>(d_centroid, d_C_pad, DIM, D);
-//
-//
-//
-//
-//     // 3) rotate
-//     float* d_XP; RAFT_CUDA_TRY(cudaMalloc(&d_XP, N*D*sizeof(float)));
-//     rotator.rotate(d_X_pad, d_XP, N);
-//     float* d_CP; RAFT_CUDA_TRY(cudaMalloc(&d_CP, D*sizeof(float)));
-//     rotator.rotate(d_C_pad, d_CP, 1);
-//
-//     //debug
-////    float* h_C_pad = (float*)malloc(D * sizeof(float));
-////    if (h_C_pad == nullptr) {
-////        fprintf(stderr, "Host malloc failed!\n");
-////        exit(EXIT_FAILURE);
-////    }
-////    RAFT_CUDA_TRY(cudaMemcpy(h_C_pad, d_CP, D * sizeof(float), cudaMemcpyDeviceToHost));
-////    printf("d_CP values on GPU:\n");
-////    for (int i = 0; i < D; ++i) {
-////        printf("h_CP[%d] = %f\n", i, h_C_pad[i]);
-////    }
-////    free(h_C_pad);
-//
-//    // 4) residuals
-//    subtractKernel<<<gridND, block>>>(d_XP, d_CP, N, D);
-//
-//    // 5) save rotated centroid
-//    RAFT_CUDA_TRY(cudaMemcpy(d_rotated_c, d_CP, D*sizeof(float), cudaMemcpyDeviceToDevice));
-//
-//    // 6) normalize
-//    int warpsPerBlock = block/32;
-//    int gridWarp = (N + warpsPerBlock - 1)/warpsPerBlock;
-//    normalizeKernel<<<gridWarp, block>>>(d_XP, d_XP_norm, N, D);
-//
-//    // 7) binarize
-//    binarizeKernel<<<gridND, block>>>(d_XP_norm, d_bin_XP, N, D);
-//    RAFT_CUDA_TRY(cudaGetLastError());
-//    RAFT_CUDA_TRY(cudaDeviceSynchronize());
-//
-//    cudaFree(d_X_pad);
-//    cudaFree(d_C_pad);
-//    cudaFree(d_XP);
-//    cudaFree(d_CP);
-//}
 
 //---------------------------------------------------------------------------
 // Kernel: rabitq_factor_kernel
@@ -863,10 +679,6 @@ void DataQuantizerGPU::store_compacted_code(uint8_t* o_raw, uint8_t* o_compact) 
 __device__ void fast_quantize_device(
   const float* o_prime, uint8_t* code, float* ip_norm, size_t D, size_t EX_BITS)
 {
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t0 = clock64();
-#endif
-
   // First loop: compute max_o.
   const double eps = 1e-5;
   const int n_enum = 10;
@@ -875,12 +687,6 @@ __device__ void fast_quantize_device(
     double val = o_prime[i];
     if (val > max_o) max_o = val;
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t1 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 1 (max_o computation) took %llu cycles\n", threadIdx.x, t1 - t0);
-  }
-#endif
 
   double t_start = (((1 << EX_BITS) - 1) / 3.0) / max_o;
   double t_end   = ((((1 << EX_BITS) - 1) + n_enum)) / max_o;
@@ -889,30 +695,16 @@ __device__ void fast_quantize_device(
   double sqr_denom = D * 0.25;
   double numerator = 0.0;
 
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t2 = clock64();
-#endif
-
   // Second loop: initial computation of cur_o_bar, updating sqr_denom and numerator.
   for (int i = 0; i < D; i++) {
     cur_o_bar[i] = int(t_start * o_prime[i] + eps);
     sqr_denom += cur_o_bar[i] * cur_o_bar[i] + cur_o_bar[i];
     numerator += (cur_o_bar[i] + 0.5) * o_prime[i];
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t3 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 2 (cur_o_bar init) took %llu cycles\n", threadIdx.x, t3 - t2);
-  }
-#endif
 
   double max_ip    = 0.0;
   double t_val     = 0.0;
   bool improvement = true;
-
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t4 = clock64();
-#endif
 
   // While loop: iterative improvement.
   while (improvement) {
@@ -937,20 +729,10 @@ __device__ void fast_quantize_device(
       }
     }
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t5 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: While loop took %llu cycles\n", threadIdx.x, t5 - t4);
-  }
-#endif
 
   sqr_denom = D * 0.25;
   numerator = 0.0;
   int o_bar[MAX_D];
-
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t6 = clock64();
-#endif
 
   // Third loop: compute final o_bar, update sqr_denom and numerator.
   for (int i = 0; i < D; i++) {
@@ -959,12 +741,6 @@ __device__ void fast_quantize_device(
     sqr_denom += o_bar[i] * o_bar[i] + o_bar[i];
     numerator += (o_bar[i] + 0.5) * o_prime[i];
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t7 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 3 (final o_bar computation) took %llu cycles\n", threadIdx.x, t7 - t6);
-  }
-#endif
 
   *ip_norm = 1.0f / (float)numerator;
   if (!isfinite(*ip_norm)) { *ip_norm = 1.0f; }
@@ -973,12 +749,6 @@ __device__ void fast_quantize_device(
   for (int i = 0; i < D; i++) {
     code[i] = (uint8_t)o_bar[i];
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t8 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 4 (code assignment) took %llu cycles\n", threadIdx.x, t8 - t7);
-  }
-#endif
 }
 
 //---------------------------------------------------------------------------
@@ -996,10 +766,6 @@ __device__ void fast_quantize_device(
 __device__ float fast_quantize_device_batch(
   const float* o_prime, uint8_t* code, float* ip_norm, size_t D, size_t EX_BITS)
 {
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t0 = clock64();
-#endif
-
   // First loop: compute max_o.
   const double eps = 1e-5;
   const int n_enum = 10;
@@ -1008,12 +774,6 @@ __device__ float fast_quantize_device_batch(
     double val = o_prime[i];
     if (val > max_o) max_o = val;
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t1 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 1 (max_o computation) took %llu cycles\n", threadIdx.x, t1 - t0);
-  }
-#endif
 
   double t_start = (((1 << EX_BITS) - 1) / 3.0) / max_o;
   double t_end   = ((((1 << EX_BITS) - 1) + n_enum)) / max_o;
@@ -1022,30 +782,16 @@ __device__ float fast_quantize_device_batch(
   double sqr_denom = D * 0.25;
   double numerator = 0.0;
 
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t2 = clock64();
-#endif
-
   // Second loop: initial computation of cur_o_bar, updating sqr_denom and numerator.
   for (int i = 0; i < D; i++) {
     cur_o_bar[i] = int(t_start * o_prime[i] + eps);
     sqr_denom += cur_o_bar[i] * cur_o_bar[i] + cur_o_bar[i];
     numerator += (cur_o_bar[i] + 0.5) * o_prime[i];
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t3 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 2 (cur_o_bar init) took %llu cycles\n", threadIdx.x, t3 - t2);
-  }
-#endif
 
   double max_ip    = 0.0;
   double t_val     = 0.0;
   bool improvement = true;
-
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t4 = clock64();
-#endif
 
   // While loop: iterative improvement.
   while (improvement) {
@@ -1070,20 +816,10 @@ __device__ float fast_quantize_device_batch(
       }
     }
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t5 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: While loop took %llu cycles\n", threadIdx.x, t5 - t4);
-  }
-#endif
 
   sqr_denom = D * 0.25;
   numerator = 0.0;
   int o_bar[MAX_D];
-
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t6 = clock64();
-#endif
 
   // Third loop: compute final o_bar, update sqr_denom and numerator.
   for (int i = 0; i < D; i++) {
@@ -1092,12 +828,6 @@ __device__ float fast_quantize_device_batch(
     sqr_denom += o_bar[i] * o_bar[i] + o_bar[i];
     numerator += (o_bar[i] + 0.5) * o_prime[i];
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t7 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 3 (final o_bar computation) took %llu cycles\n", threadIdx.x, t7 - t6);
-  }
-#endif
 
   *ip_norm = 1.0f / (float)numerator;
   if (!isfinite(*ip_norm)) { *ip_norm = 1.0f; }
@@ -1106,12 +836,6 @@ __device__ float fast_quantize_device_batch(
   for (int i = 0; i < D; i++) {
     code[i] = (uint8_t)o_bar[i];
   }
-#ifdef DEBUG_EXRABITQ_TIME
-  unsigned long long t8 = clock64();
-  if (blockIdx.x == 0 && threadIdx.x == 0) {
-    printf("Thread %d: Loop 4 (code assignment) took %llu cycles\n", threadIdx.x, t8 - t7);
-  }
-#endif
   return *ip_norm;
 }
 
@@ -1660,11 +1384,6 @@ __device__ float best_rescale_factor_device(
     max_o = fmaxf(max_o, o_abs[i]);
   }
 
-  //    // Handle edge case where all values are zero
-  //    if (max_o < kEps) {
-  //        return 1.0f;
-  //    }
-
   float t_end   = static_cast<float>(((1 << ex_bits) - 1) + kNEnum) / max_o;
   float t_start = t_end * d_kTightStart[ex_bits];
 
@@ -1682,10 +1401,8 @@ __device__ float best_rescale_factor_device(
   // Initialize priority queue
   int heap_size = 0;
   for (int i = 0; i < dim; ++i) {
-    //        if (o_abs[i] > kEps) {  // Only add non-zero elements
     float next_t = static_cast<float>(cur_o_bar[i] + 1) / o_abs[i];
     heap_push(heap_buffer, heap_size, next_t, i);
-    //        }
   }
 
   float max_ip = 0.0f;
@@ -1797,11 +1514,6 @@ __device__ double best_rescale_factor_device_fp64(
     max_o = fmaxf(max_o, o_abs[i]);
   }
 
-  //    // Handle edge case where all values are zero
-  //    if (max_o < kEps) {
-  //        return 1.0f;
-  //    }
-
   double t_end   = static_cast<float>(((1 << ex_bits) - 1) + kNEnum) / max_o;
   double t_start = t_end * d_kTightStart[ex_bits];
 
@@ -1819,10 +1531,8 @@ __device__ double best_rescale_factor_device_fp64(
   // Initialize priority queue
   int heap_size = 0;
   for (int i = 0; i < dim; ++i) {
-    //        if (o_abs[i] > kEps) {  // Only add non-zero elements
     float next_t = static_cast<double>(cur_o_bar[i] + 1) / o_abs[i];
     heap_push(heap_buffer, heap_size, next_t, i);
-    //        }
   }
 
   double max_ip = 0.0f;
@@ -1884,8 +1594,6 @@ __global__ void exrabitq_codes_kernel_batch(const int* d_bin_XP,
       float val    = d_XP_norm[i * D + j];
       local_abs[j] = fabsf(val);
     }
-    //        float ip_norm;  // ip norm env
-    //        fast_quantize_device(local_abs, tmp_code, &ip_norm, D, EX_BITS);
     // Allocate shared memory or use dynamic allocation
     // Each thread gets its own workspace in global memory
     int workspace_size = D * 2 + D * 2;  // tmp_code + cur_o_bar + heap_buffer
@@ -1935,9 +1643,6 @@ void DataQuantizerGPU::exrabitq_codes(const int* d_bin_XP,
   RAFT_CUDA_TRY(cudaPeekAtLastError());
   raft::resource::sync_stream(handle_);
 }
-#ifdef DEBUG_BATCH_CONSTRUCT
-int debug_first_cluster_count = 0;
-#endif
 
 //---------------------------------------------------------------------------
 // Host function: DataQuantizerGPU::exrabitq_codes_batch
@@ -1976,22 +1681,6 @@ void DataQuantizerGPU::exrabitq_codes_batch(const int* d_bin_XP,
                                                                    d_workspace);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-#ifdef DEBUG_BATCH_CONSTRUCT
-  if (debug_first_cluster_count < 1) {
-    debug_first_cluster_count++;
-    std::cout << "No." << debug_first_cluster_count
-              << " vector of the first cluster's first 20 long codes:\n";
-    int h_bin_XP[20];
-    RAFT_CUDA_TRY(
-      cudaMemcpyAsync(h_bin_XP, d_temp_codes, 20 * sizeof(int), cudaMemcpyDeviceToHost, stream_));
-    raft::resource::sync_stream(*handle);
-
-    // Print them
-    for (int i = 0; i < 20; i++) {
-      std::cout << "d_long[" << i << "] = " << h_bin_XP[i] << std::endl;
-    }
-  }
-#endif
   // Then compute factors
   compute_factors_packed_batch(
     d_centroid, d_temp_codes, d_XP, ip_norm_inv, num_points, D, 1.9, d_ex_factor, EX_BITS, stream_);
@@ -2025,17 +1714,7 @@ void DataQuantizerGPU::quantize(const float* d_data,
                                 float* d_ex_factor,
                                 float* d_rotated_c) const
 {
-#ifdef DEBUG_TIME
-  cudaEvent_t start, stop;
-  float elapsed;
-  RAFT_CUDA_TRY(cudaEventCreate(&start));
-  RAFT_CUDA_TRY(cudaEventCreate(&stop));
-#endif
-
   // 1. Data Transformation:
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   float* d_XP_norm = nullptr;
   int* d_bin_XP    = nullptr;
   RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_XP_norm, num_points * D * sizeof(float), stream_));
@@ -2043,29 +1722,10 @@ void DataQuantizerGPU::quantize(const float* d_data,
   raft::resource::sync_stream(handle_);
   data_transformation(
     d_data, d_centroid, d_IDs, num_points, rotator, d_rotated_c, d_XP_norm, d_bin_XP);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 1 (Data Transformation): %f seconds\n", elapsed / 1000.0f);
-#endif
 
-  // 2. Compute total blocks for factors and short codes.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
-//    size_t total_blocks = div_rd_up(num_points, FAST_SIZE);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 2 (Compute total blocks): %f seconds\n", elapsed / 1000.0f);
-#endif
+  // 2. (skipped) Compute total blocks for factors and short codes.
 
   // 3. Allocate intermediate buffers on device.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   size_t code_len             = short_code_length();  // from quantizer parameters.
   size_t short_codes_bytes    = code_len * num_points * sizeof(uint32_t);
   uint32_t* d_all_short_codes = nullptr;
@@ -2080,30 +1740,11 @@ void DataQuantizerGPU::quantize(const float* d_data,
   RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_all_factor_ip, factor_bytes, stream_));
   RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_all_factor_sumxb, factor_bytes, stream_));
   RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_all_factor_err, factor_bytes, stream_));
-#ifdef DEBUG_TIME
-  raft::resource::sync_stream(handle_);
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 3 (Allocate intermediate buffers): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 4. Compute RaBitQ quantization codes.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   rabitq_codes(d_bin_XP, d_all_short_codes, num_points);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 4 (Compute RaBitQ codes): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 5. Compute re-ranking factors.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   rabitq_factor(d_data,
                 d_centroid,
                 d_IDs,
@@ -2114,34 +1755,15 @@ void DataQuantizerGPU::quantize(const float* d_data,
                 d_all_factor_sumxb,
                 d_all_factor_err,
                 num_points);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 5 (Compute re-ranking factors): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 6. Compute ExRaBitQ quantization codes.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   exrabitq_codes(d_bin_XP, d_XP_norm, d_long_code, d_ex_factor, d_all_factor_x2, num_points);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 6 (Compute ExRaBitQ codes): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 7. Copy short codes and factor blocks into final output d_short_data.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   uint32_t* cur_block = d_short_data;
   // copy point by point (follows point-factor data layout)
   for (size_t i = 0; i < num_points; i++) {
     size_t block_code_bytes = code_len * sizeof(uint32_t);
-    //        printf("short code Len %d in uint32_t", code_len);
     RAFT_CUDA_TRY(cudaMemcpyAsync(cur_block,
                                   d_all_short_codes + i * code_len,
                                   block_code_bytes,
@@ -2152,17 +1774,6 @@ void DataQuantizerGPU::quantize(const float* d_data,
     float* block_fac = (float*)block_factor(cur_block, D);
     RAFT_CUDA_TRY(cudaMemcpyAsync(
       block_fac, d_all_factor_x2 + i, sizeof(float), cudaMemcpyDeviceToDevice, stream_));
-
-    // debug
-    //        float temp_float;
-    //        RAFT_CUDA_TRY(cudaMemcpy(&temp_float,
-    //                              d_all_factor_x2 + i,
-    //                              sizeof(float), cudaMemcpyDeviceToHost));
-    //        printf("factors: %f\n", temp_float);
-    //        if (temp_float > 89623303555.0) {
-    //            printf("What's wrong ????? \n");
-    //        }
-
 #else
     uint8_t* block_fac = block_factor(cur_block, D);
     float* cur_x2      = factor_x2(block_fac);
@@ -2193,17 +1804,8 @@ void DataQuantizerGPU::quantize(const float* d_data,
     raft::resource::sync_stream(handle_);
     cur_block = next_block(cur_block, code_len, FAST_SIZE, NUM_SHORT_FACTORS);
   }
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 7 (Copy short codes and factor blocks): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 8. Free intermediate buffers.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   RAFT_CUDA_TRY(cudaFreeAsync(d_all_short_codes, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_all_factor_x2, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_all_factor_ip, stream_));
@@ -2213,17 +1815,6 @@ void DataQuantizerGPU::quantize(const float* d_data,
   RAFT_CUDA_TRY(cudaFreeAsync(d_bin_XP, stream_));
 
   raft::resource::sync_stream(handle_);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 8 (Free intermediate buffers): %f seconds\n", elapsed / 1000.0f);
-#endif
-
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventDestroy(start));
-  RAFT_CUDA_TRY(cudaEventDestroy(stop));
-#endif
 }
 
 __inline__ __device__ float warpReduceSum(float v)
@@ -2305,9 +1896,7 @@ __global__ void RowwisePackedKernel(const float* __restrict__ d_centroid,  // [D
     d_out[base + 2] = ferr;
   }
 }
-#ifdef DEBUG_BATCH_CONSTRUCT
-int debug_first_cluster_count_4 = 0;
-#endif
+
 // compute factors for batch data
 void compute_factors_packed(const float* d_centroid,  // [D]
                             const int* d_bin_XP,      // [N*D]
@@ -2324,20 +1913,6 @@ void compute_factors_packed(const float* d_centroid,  // [D]
   RowwisePackedKernel<<<grid, block, 0, stream>>>(
     d_centroid, d_bin_XP, d_XP, N, D, d_out, kConstEpsilon);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
-#ifdef DEBUG_BATCH_CONSTRUCT
-  if (debug_first_cluster_count_4 == 0) {
-    debug_first_cluster_count_4++;
-    std::cout << "First vector of the first cluster's short factors:\n";
-    float h_bin_XP[3];
-    RAFT_CUDA_TRY(
-      cudaMemcpyAsync(h_bin_XP, d_out, 3 * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-    std::cout << "f_add = " << h_bin_XP[0] << std::endl;
-    std::cout << "f_rescale = " << h_bin_XP[1] << std::endl;
-    std::cout << "f_error = " << h_bin_XP[2] << std::endl;
-  }
-#endif
 }
 
 // One block per row; reduces across D
@@ -2385,40 +1960,23 @@ __global__ void RowwisePackedKernelBatch(const float* __restrict__ d_centroid,  
     float l2_norm = sqrtf(fmaxf(l2_sqr, 0.f));
     float denom   = ip_resi_xucb;
 
-    float fadd_ex = l2_sqr + 2.f * l2_sqr * ip_cent_xucb / denom;
-#ifdef DEBUG_BATCH_CONSTRUCT
-    if (fadd_ex < -40) {
-      printf("f_add_ex < 0! f_add_ex: %f, l2_sqr: %f, ip_cent_xucb: %f, denom: %f\n",
-             fadd_ex,
-             l2_sqr,
-             ip_cent_xucb,
-             denom);
-    }
-#endif
+    float fadd_ex     = l2_sqr + 2.f * l2_sqr * ip_cent_xucb / denom;
     float frescale_ex = -2.f * l2_norm * d_ipnorm_inv[i];
 
     float ratio     = (l2_sqr * xu_sq) / (denom * denom);
     float inner     = (ratio - 1.f) / fmaxf(float(D - 1), 1.f);
     inner           = fmaxf(inner, 0.f);
     float tmp_error = l2_norm * kConstEpsilon * sqrtf(inner);
-    //        float ferr_ex = 2.f * tmp_error;
 
     // pack: [f_add, f_rescale, f_error]
     size_t base     = 2 * i;
     d_out[base + 0] = fadd_ex;
     d_out[base + 1] = frescale_ex;
-    //        d_out[base + 2] = ferr_ex;
-    // ferr_ex not used
   }
 }
 
 // compute factors for batch data
 // This is used for ex_codes
-#ifdef DEBUG_BATCH_CONSTRUCT
-
-int debug_first_cluster_count_3 = 0;
-#endif
-
 void compute_factors_packed_batch(const float* d_centroid,  // [D]
                                   const int* d_xu,          // [N*D]
                                   const float* d_XP,        // [N*D]
@@ -2436,32 +1994,7 @@ void compute_factors_packed_batch(const float* d_centroid,  // [D]
   RowwisePackedKernelBatch<<<grid, block, 0, stream>>>(
     d_centroid, d_xu, d_XP, ipnorm_inv, N, D, d_out, kConstEpsilon, ex_bits);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
-#ifdef DEBUG_BATCH_CONSTRUCT
-  if (debug_first_cluster_count_3 == 0) {
-    debug_first_cluster_count_3++;
-    std::cout << "First vector of the first cluster's ex factors:\n";
-    float h_bin_XP[2];
-    RAFT_CUDA_TRY(
-      cudaMemcpyAsync(h_bin_XP, d_out, 2 * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-    std::cout << "f_ex_add = " << h_bin_XP[0] << std::endl;
-    std::cout << "f_ex_rescale = " << h_bin_XP[1] << std::endl;
-
-    RAFT_CUDA_TRY(
-      cudaMemcpyAsync(h_bin_XP, d_out + 2, 2 * sizeof(float), cudaMemcpyDeviceToHost, stream));
-    RAFT_CUDA_TRY(cudaStreamSynchronize(stream));
-
-    std::cout << "Second vector of the first cluster's ex factors:\n";
-    std::cout << "f_ex_add = " << h_bin_XP[0] << std::endl;
-    std::cout << "f_ex_rescale = " << h_bin_XP[1] << std::endl;
-  }
-#endif
 }
-
-#ifdef DEBUG_BATCH_CONSTRUCT
-int debug_first_cluster_count_2 = 0;
-#endif
 
 void DataQuantizerGPU::quantize_batch(const float* d_data,
                                       const float* d_centroid,
@@ -2474,17 +2007,7 @@ void DataQuantizerGPU::quantize_batch(const float* d_data,
                                       float* d_ex_factor,
                                       float* d_rotated_c) const
 {
-#ifdef DEBUG_TIME
-  cudaEvent_t start, stop;
-  float elapsed;
-  RAFT_CUDA_TRY(cudaEventCreate(&start));
-  RAFT_CUDA_TRY(cudaEventCreate(&stop));
-#endif
-
   // 1. Data Transformation:
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   float* d_XP_norm = nullptr;
   int* d_bin_XP    = nullptr;
   float* d_XP;
@@ -2493,123 +2016,29 @@ void DataQuantizerGPU::quantize_batch(const float* d_data,
   RAFT_CUDA_TRY(cudaMallocAsync((void**)&d_XP, num_points * D * sizeof(float), stream_));
   data_transformation_batch(
     d_data, d_centroid, d_IDs, num_points, rotator, d_rotated_c, d_XP_norm, d_bin_XP, d_XP);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 1 (Data Transformation): %f seconds\n", elapsed / 1000.0f);
-#endif
 
-#ifdef DEBUG_BATCH_CONSTRUCT
-  if (debug_first_cluster_count_2 == 0) {
-    debug_first_cluster_count_2++;
-    std::cout << "First vector of the first cluster's first 20 short codes:\n";
-    int h_bin_XP[20];
-    RAFT_CUDA_TRY(
-      cudaMemcpyAsync(h_bin_XP, d_bin_XP, 20 * sizeof(int), cudaMemcpyDeviceToHost, stream_));
-    raft::resource::sync_stream(handle_);
-
-    // Print them
-    for (int i = 0; i < 20; i++) {
-      std::cout << "d_bin_XP[" << i << "] = " << h_bin_XP[i] << std::endl;
-    }
-  }
-#endif
-
-  // 2. Compute total blocks for factors and short codes.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
-//    size_t total_blocks = div_rd_up(num_points, FAST_SIZE);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 2 (Compute total blocks): %f seconds\n", elapsed / 1000.0f);
-#endif
+  // 2. (skipped) Compute total blocks for factors and short codes.
 
   // 3. Allocate intermediate buffers on device.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
-  size_t code_len          = short_code_length();  // from quantizer parameters.
-  size_t short_codes_bytes = code_len * num_points * sizeof(uint32_t);
-  //    uint32_t* d_all_short_codes = nullptr;
-  //    RAFT_CUDA_TRY(cudaMalloc((void**) &d_all_short_codes, short_codes_bytes));
-
-  size_t factor_bytes = num_points * sizeof(float) * 3;  // we have 3 factors for batch data
-//    float* d_all_data_factors = nullptr;
-//    cudaMalloc((void**) &d_all_data_factors, factor_bytes);
-//    float* d_all_factor_x2 = nullptr;
-//    float* d_all_factor_ip = nullptr;
-//    float* d_all_factor_sumxb = nullptr;
-//    float* d_all_factor_err = nullptr;
-//    RAFT_CUDA_TRY(cudaMalloc((void**) &d_all_factor_x2, factor_bytes));
-//    RAFT_CUDA_TRY(cudaMalloc((void**) &d_all_factor_ip, factor_bytes));
-//    RAFT_CUDA_TRY(cudaMalloc((void**) &d_all_factor_sumxb, factor_bytes));
-//    RAFT_CUDA_TRY(cudaMalloc((void**) &d_all_factor_err, factor_bytes));
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 3 (Allocate intermediate buffers): %f seconds\n", elapsed / 1000.0f);
-#endif
+  size_t code_len = short_code_length();  // from quantizer parameters.
 
   // 4. Compute RaBitQ quantization codes.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   rabitq_codes(d_bin_XP, d_short_data, num_points);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 4 (Compute RaBitQ codes): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 5. Compute RaBitQ factors.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   compute_factors_packed(
     d_rotated_c, d_bin_XP, d_XP, num_points, D, 1.9, d_short_data_factors, stream_);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 5 (Compute re-ranking factors): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 6. Compute ExRaBitQ quantization codes.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   exrabitq_codes_batch(
     d_bin_XP, d_XP_norm, d_XP, d_long_code, d_ex_factor, d_rotated_c, num_points);
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 6 (Compute ExRaBitQ codes): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 7. Copy short codes and factor blocks into final output d_short_data.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   uint32_t* cur_block = d_short_data;
   // copy point by point (follows point-factor data layout)
   for (size_t i = 0; i < num_points; i++) {
-    size_t block_code_bytes = code_len * sizeof(uint32_t);
-//        RAFT_CUDA_TRY(cudaMemcpy(cur_block,
-//                              d_all_short_codes + i * code_len,
-//                              block_code_bytes, cudaMemcpyDeviceToDevice));
 #if defined(HIGH_ACC_FAST_SCAN)
     float* block_fac = (float*)block_factor(cur_block, D);
-    //        RAFT_CUDA_TRY(cudaMemcpy(block_fac,
-    //                              d_all_factor_x2 + i,
-    //                              sizeof(float), cudaMemcpyDeviceToDevice));
-
 #else
     uint8_t* block_fac = block_factor(cur_block, D);
     float* cur_x2      = factor_x2(block_fac);
@@ -2640,46 +2069,22 @@ void DataQuantizerGPU::quantize_batch(const float* d_data,
     raft::resource::sync_stream(handle_);
     cur_block = next_block(cur_block, code_len, FAST_SIZE, NUM_SHORT_FACTORS);
   }
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 7 (Copy short codes and factor blocks): %f seconds\n", elapsed / 1000.0f);
-#endif
 
   // 8. Free intermediate buffers.
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(start));
-#endif
   RAFT_CUDA_TRY(cudaFreeAsync(d_XP_norm, stream_));
   RAFT_CUDA_TRY(cudaFreeAsync(d_bin_XP, stream_));
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventRecord(stop));
-  RAFT_CUDA_TRY(cudaEventSynchronize(stop));
-  RAFT_CUDA_TRY(cudaEventElapsedTime(&elapsed, start, stop));
-  printf("Step 8 (Free intermediate buffers): %f seconds\n", elapsed / 1000.0f);
-#endif
-
-#ifdef DEBUG_TIME
-  RAFT_CUDA_TRY(cudaEventDestroy(start));
-  RAFT_CUDA_TRY(cudaEventDestroy(stop));
-#endif
 }
-  void DataQuantizerGPU::alloc_buffers(size_t num_points) {
-
+void DataQuantizerGPU::alloc_buffers(size_t num_points)
+{
   const int64_t size_norm = static_cast<int64_t>(num_points) * D;
   const int64_t size_bin  = static_cast<int64_t>(num_points) * D;
   const int64_t size_xp   = static_cast<int64_t>(num_points + 1) * D;
 
   // Overwrite RAFT device vectors with new allocations
-  d_XP_norm      = raft::make_device_vector<float, int64_t>(handle_, size_norm);
-  d_bin_XP       = raft::make_device_vector<int, int64_t>(handle_, size_bin);
-  d_XP           = raft::make_device_vector<float, int64_t>(handle_, size_xp);
-  d_X_and_C_pad  = raft::make_device_vector<float, int64_t>(handle_, size_xp);
-
+  d_XP_norm     = raft::make_device_vector<float, int64_t>(handle_, size_norm);
+  d_bin_XP      = raft::make_device_vector<int, int64_t>(handle_, size_bin);
+  d_XP          = raft::make_device_vector<float, int64_t>(handle_, size_xp);
+  d_X_and_C_pad = raft::make_device_vector<float, int64_t>(handle_, size_xp);
 }
 
-
 }  // namespace cuvs::neighbors::ivf_rabitq::detail
-
-

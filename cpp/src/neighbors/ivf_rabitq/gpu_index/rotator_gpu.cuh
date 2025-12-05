@@ -10,7 +10,6 @@
 #pragma once
 
 #include "../defines.hpp"
-#include "../utils/utils_cuda.cuh"
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/mdspan_types.hpp>
@@ -69,9 +68,11 @@ class RotatorGPU {
 
  private:
   raft::resources const& handle_;  // reusable resource handle
-  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
-  size_t D;                        // Padded dimension
-  raft::device_matrix<float, int64_t, raft::row_major> rotation_matrix_;  // Rotation matrix P
+  rmm::cuda_stream_view stream_ =
+    raft::resource::get_cuda_stream(handle_);  // CUDA stream obtained from handle_
+  size_t D;                                    // Padded dimension
+  raft::device_matrix<float, int64_t, raft::row_major> rotation_matrix_ =
+    raft::make_device_matrix<float, int64_t, raft::row_major>(handle_, 0, 0);  // Rotation matrix P
 };
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

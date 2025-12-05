@@ -9,8 +9,6 @@
 
 #pragma once
 
-#include "../utils/utils_cuda.cuh"
-
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/resources.hpp>
 
@@ -102,11 +100,6 @@ struct DeviceResultPool {
     distances(idx) = dist;
     if (size < capacity) size++;
   }
-
-  // Return the current worst distance (if full), or maximum float if not full.
-  //    __device__ float worst_distance() const {
-  //        return (size == capacity) ? distances[size - 1] : std::numeric_limits<float>::max();
-  //    }
 };
 
 DeviceResultPool createDeviceResultPool(raft::resources const& handle, const int capacity);

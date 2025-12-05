@@ -10,7 +10,6 @@
 #pragma once
 
 #include "../defines.hpp"
-#include "../utils/utils_cuda.cuh"
 
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
@@ -32,7 +31,7 @@ class InitializerGPU {
    * @param k number of centroids
    */
   explicit InitializerGPU(raft::resources const& handle, size_t d, size_t k)
-    : D(d), K(k), handle_(handle), stream_(raft::resource::get_cuda_stream(handle_))
+    : D(d), K(k), handle_(handle)
   {
   }
 
@@ -87,7 +86,8 @@ class InitializerGPU {
   size_t D;                        // Dimension
   size_t K;                        // Num of Centroids
   raft::resources const& handle_;  // reusable resource handle
-  rmm::cuda_stream_view stream_;   // CUDA stream obtained from handle_
+  rmm::cuda_stream_view stream_ =
+    raft::resource::get_cuda_stream(handle_);  // CUDA stream obtained from handle_
 };
 
 class FlatInitializerGPU : public InitializerGPU {
@@ -123,8 +123,9 @@ class FlatInitializerGPU : public InitializerGPU {
  private:
   // D, K are inherited from parent
 
-  raft::device_matrix<float, int64_t, raft::row_major>
-    centroids_;  // Stored in GPU device memory. Points to the parent centroids' array
+  raft::device_matrix<float, int64_t, raft::row_major> centroids_ =
+    raft::make_device_matrix<float, int64_t, raft::row_major>(
+      handle_, K, D);  // Stored in GPU device memory. Points to the parent centroids' array
 
   // For simplicity, we use a single distance function.
   float (*dist_func)(const float* __restrict__, const float* __restrict__, size_t);
