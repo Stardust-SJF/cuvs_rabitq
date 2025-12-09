@@ -3872,7 +3872,7 @@ void SearcherGPU::SearchClusterQueryPairs(const IVFGPU& cur_ivf,
   else {
     size_t shared_mem_size = max(num_chunks * LUT_SIZE * sizeof(float) + cur_ivf.get_max_cluster_length() * (sizeof(float) + sizeof(int)), (size_t)smem_bytes);
     RAFT_CUDA_TRY(cudaFuncSetAttribute(
-    computeInnerProductsWithLUT, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
+    computeInnerProductsWithLUTNoEX, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
     computeInnerProductsWithLUTNoEX<<<gridDim, blockDim, shared_mem_size, stream_>>>(
       d_sorted_pairs,
       d_query,
@@ -4245,7 +4245,7 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(
       max(first_part_shared_mem + second_part_shared_mem + third_part_shared_mem, (size_t)smem_bytes);
     // Note that for large dimensions, we need to set it for specific kernel
     RAFT_CUDA_TRY(cudaFuncSetAttribute(
-    computeInnerProductsWithLUT, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
+    computeInnerProductsWithLUT16Opt, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
     computeInnerProductsWithLUT16Opt<<<gridDim, blockDim, shared_mem_size, stream_>>>(
       d_sorted_pairs,
       d_query,
@@ -4281,7 +4281,7 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(
       max(first_part_shared_mem + second_part_shared_mem, (size_t)smem_bytes);
     // Note that for large dimensions, we need to set it for specific kernel
     RAFT_CUDA_TRY(cudaFuncSetAttribute(
-    computeInnerProductsWithLUT, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
+    computeInnerProductsWithLUT16OptNoEX, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
     computeInnerProductsWithLUT16OptNoEX<<<gridDim, blockDim, shared_mem_size, stream_>>>(
       d_sorted_pairs,
       d_query,
