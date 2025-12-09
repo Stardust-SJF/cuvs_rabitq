@@ -11,8 +11,6 @@
 
 #include <curand_kernel.h>
 
-#include <curand_kernel.h>
-
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/host_mdarray.hpp>
 #include <raft/core/resource/cuda_stream.hpp>
