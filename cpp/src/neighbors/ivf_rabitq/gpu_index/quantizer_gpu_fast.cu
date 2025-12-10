@@ -1074,31 +1074,6 @@ void DataQuantizerGPU::exrabitq_codes_and_factors_fused_ori(const int* d_bin_XP,
   raft::resource::sync_stream(handle_);
 }
 
-// GPU kernel for final reduction
-__global__ void reduce_sum_kernel(const float* __restrict__ input,
-                                  float* __restrict__ output,
-                                  int n)
-{
-  extern __shared__ float sdata[];
-
-  int tid = threadIdx.x;
-  int i   = blockIdx.x * blockDim.x * 2 + tid;
-
-  float sum = 0;
-  if (i < n) sum += input[i];
-  if (i + blockDim.x < n) sum += input[i + blockDim.x];
-
-  sdata[tid] = sum;
-  __syncthreads();
-
-  for (int s = blockDim.x / 2; s > 0; s >>= 1) {
-    if (tid < s) { sdata[tid] += sdata[tid + s]; }
-    __syncthreads();
-  }
-
-  if (tid == 0) output[blockIdx.x] = sdata[0];
-}
-
 __global__ void fully_fused_kernel(float* __restrict__ output_factors,
                                    const int rows,
                                    const int cols,
@@ -1172,12 +1147,8 @@ float DataQuantizerGPU::get_const_scaling_factors_fully_gpu(size_t dim, size_t e
                             ) *
                            sizeof(float);
 
-  // Check shared memory limit
-  if (shared_mem_size > 49152) {
-    cudaFuncSetAttribute(fully_fused_kernel,
-                         cudaFuncAttributeMaxDynamicSharedMemorySize,
-                         98304);  // 96KB for ampere devices
-  }
+  RAFT_CUDA_TRY(cudaFuncSetAttribute(
+    fully_fused_kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
 
   unsigned long long seed = time(nullptr);
   // Launch fully fused kernel
