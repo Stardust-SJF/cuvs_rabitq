@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 #pragma once
@@ -41,7 +41,6 @@ class cuvs_ivf_rabitq : public algo<T>, public algo_gpu {
   cuvs_ivf_rabitq(Metric metric, int dim, const build_param& param)
     : algo<T>(metric, dim), index_params_(param), dimension_(dim)
   {
-    // index_params_.metric = parse_metric_type(metric);
   }
 
   void build(const T* dataset, size_t nrow) final;
@@ -92,7 +91,7 @@ void cuvs_ivf_rabitq<T, IdxT>::save(const std::string& file) const
 template <typename T, typename IdxT>
 void cuvs_ivf_rabitq<T, IdxT>::load(const std::string& file)
 {
-  index_ = std::make_shared<cuvs::neighbors::ivf_rabitq::index<IdxT>>(handle_, index_params_, dim_);
+  index_ = std::make_shared<cuvs::neighbors::ivf_rabitq::index<IdxT>>(handle_);
   cuvs::neighbors::ivf_rabitq::deserialize(handle_, file, index_.get());
 }
 
@@ -103,9 +102,9 @@ void cuvs_ivf_rabitq<T, IdxT>::build(const T* dataset, size_t nrow)
   size_t n_streams = 1;
   raft::resource::set_cuda_stream_pool(handle_, std::make_shared<rmm::cuda_stream_pool>(n_streams));
   auto dataset_v = raft::make_device_matrix_view<const T, IdxT>(dataset, IdxT(nrow), dim_);
-  index_         = std::make_shared<cuvs::neighbors::ivf_rabitq::index<IdxT>>(
-    handle_, nrow, dim_, index_params_.n_lists, index_params_.bits_per_dim);
-  cuvs::neighbors::ivf_rabitq::build(handle_, index_params_, dataset_v, index_.get());
+  std::make_shared<cuvs::neighbors::ivf_rabitq::index<IdxT>>(
+    std::move(cuvs::neighbors::ivf_rabitq::build(handle_, index_params_, dataset_v)))
+    .swap(index_);
   // Note: internally the IVF-RaBitQ build works with simple pointers, and accepts both host and
   // device pointer. Therefore, although we provide here a device_mdspan, this works with host
   // pointer too.
@@ -139,27 +138,26 @@ void cuvs_ivf_rabitq<T, IdxT>::search(
   static_assert(std::is_integral_v<algo_base::index_type>);
   static_assert(std::is_integral_v<IdxT>);
 
-  IdxT* neighbors_idx_t;
+  IdxT* neighbors_idx;
   std::optional<rmm::device_uvector<IdxT>> neighbors_storage{std::nullopt};
   if constexpr (sizeof(IdxT) == sizeof(algo_base::index_type)) {
-    neighbors_idx_t = reinterpret_cast<IdxT*>(neighbors);
+    neighbors_idx = reinterpret_cast<IdxT*>(neighbors);
   } else {
     neighbors_storage.emplace(batch_size * k, raft::resource::get_cuda_stream(handle_));
-    neighbors_idx_t = neighbors_storage->data();
+    neighbors_idx = neighbors_storage->data();
   }
 
   auto queries_view =
-    raft::make_device_matrix_view<const T, uint32_t>(queries, batch_size, dimension_);
-  auto neighbors_view =
-    raft::make_device_matrix_view<IdxT, uint32_t>(neighbors_idx_t, batch_size, k);
-  auto distances_view = raft::make_device_matrix_view<float, uint32_t>(distances, batch_size, k);
+    raft::make_device_matrix_view<const T, int64_t>(queries, batch_size, dimension_);
+  auto neighbors_view = raft::make_device_matrix_view<IdxT, int64_t>(neighbors_idx, batch_size, k);
+  auto distances_view = raft::make_device_matrix_view<float, int64_t>(distances, batch_size, k);
 
   cuvs::neighbors::ivf_rabitq::search(
     handle_, search_params_, *index_, queries_view, neighbors_view, distances_view);
 
   if constexpr (sizeof(IdxT) != sizeof(algo_base::index_type)) {
     raft::linalg::unaryOp(neighbors,
-                          neighbors_idx_t,
+                          neighbors_idx,
                           batch_size * k,
                           raft::cast_op<algo_base::index_type>(),
                           raft::resource::get_cuda_stream(handle_));

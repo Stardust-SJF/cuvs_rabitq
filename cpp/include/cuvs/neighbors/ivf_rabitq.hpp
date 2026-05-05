@@ -51,10 +51,34 @@ struct index_params : cuvs::neighbors::index_params {
   uint32_t bits_per_dim = 3;
   /** The number of iterations searching for kmeans centers (index building). */
   uint32_t kmeans_n_iters = 20;
-  /** The fraction of data to use during iterative kmeans building. */
-  double kmeans_trainset_fraction = 0.5;
+  /** The number of data vectors (per cluster) to use during iterative kmeans building. */
+  uint32_t max_train_points_per_cluster = 256;
   /** Flag for using the fast quantize method */
-  bool fast_quantize_flag = false;
+  bool fast_quantize_flag = true;
+  /**
+   * Maximum number of vectors per batch when using streaming construction.
+   *
+   * This parameter controls the batch size during streaming construction from host memory.
+   * Batches contain complete clusters only (no partial clusters across batch boundaries).
+   *
+   * Note: Streaming construction is automatically used when the dataset doesn't fit
+   * comfortably in GPU memory (determined by available workspace and kTolerableRatio).
+   */
+  size_t streaming_batch_size = 100000;
+  /**
+   * Force streaming construction regardless of dataset size.
+   *
+   * When set to true, streaming construction will be used even if the dataset would fit
+   * in GPU memory. This is useful for testing or when you want explicit control over
+   * the construction method.
+   *
+   * Note: This parameter only applies when the input dataset is in host memory. If the
+   * dataset is already in device memory, streaming construction is not applicable and
+   * this parameter has no effect.
+   *
+   * Default: false (auto-detect based on available memory)
+   */
+  bool force_streaming = false;
 };
 /**
  * @}
@@ -124,9 +148,6 @@ struct index : cuvs::neighbors::index {
         uint32_t n_lists,
         uint32_t bits_per_dim);
 
-  /** Construct an empty index. It needs to be trained and then populated. */
-  index(raft::resources const& handle, const index_params& params, uint32_t dim);
-
   /** Dimensionality of the input data. */
   uint32_t dim() const noexcept;
 
@@ -156,20 +177,19 @@ struct index : cuvs::neighbors::index {
  *   // use default index parameters
  *   ivf_rabitq::index_params index_params;
  *   // create and fill the index from a [N, D] dataset
- *   cuvs::neighbors::ivf_rabitq::index<int64_t> index;
- *   ivf_rabitq::build(handle, index_params, dataset, &index);
+ *   auto index = ivf_rabitq::build(handle, index_params, dataset);
  * @endcode
  *
  * @param[in] handle
  * @param[in] index_params configure the index building
  * @param[in] dataset a device_matrix_view to a row-major matrix [n_rows, dim]
- * @param[out] idx reference to ivf_rabitq::index
+ * @return the constructed ivf-rabitq index
  *
  */
-void build(raft::resources const& handle,
+auto build(raft::resources const& handle,
            const cuvs::neighbors::ivf_rabitq::index_params& index_params,
-           raft::device_matrix_view<const float, int64_t, raft::row_major> dataset,
-           cuvs::neighbors::ivf_rabitq::index<int64_t>* idx);
+           raft::device_matrix_view<const float, int64_t, raft::row_major> dataset)
+  -> cuvs::neighbors::ivf_rabitq::index<int64_t>;
 
 /**
  * @brief Build the index from the dataset for efficient search.
@@ -180,20 +200,19 @@ void build(raft::resources const& handle,
  *   // use default index parameters
  *   ivf_rabitq::index_params index_params;
  *   // create and fill the index from a [N, D] dataset
- *   cuvs::neighbors::ivf_rabitq::index<int64_t> index;
- *   ivf_rabitq::build(handle, index_params, dataset, &index);
+ *   auto index = ivf_rabitq::build(handle, index_params, dataset);
  * @endcode
  *
  * @param[in] handle
  * @param[in] index_params configure the index building
  * @param[in] dataset a host_matrix_view to a row-major matrix [n_rows, dim]
- * @param[out] idx reference to ivf_rabitq::index
+ * @return the constructed ivf-rabitq index
  *
  */
-void build(raft::resources const& handle,
+auto build(raft::resources const& handle,
            const cuvs::neighbors::ivf_rabitq::index_params& index_params,
-           raft::host_matrix_view<const float, int64_t, raft::row_major> dataset,
-           cuvs::neighbors::ivf_rabitq::index<int64_t>* idx);
+           raft::host_matrix_view<const float, int64_t, raft::row_major> dataset)
+  -> cuvs::neighbors::ivf_rabitq::index<int64_t>;
 /**
  * @}
  */

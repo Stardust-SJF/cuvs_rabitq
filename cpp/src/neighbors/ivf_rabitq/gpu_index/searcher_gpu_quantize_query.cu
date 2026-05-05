@@ -9,13 +9,15 @@
 
 // This file implements `SearcherGPU::SearchClusterQueryPairsQuantizeQuery`.
 #include "../../detail/smem_utils.cuh"
-#include "../../ivf_flat/ivf_flat_interleaved_scan.cuh"
+#include "../../ivf_flat/detail/jit_lto_kernels/interleaved_scan_impl.cuh"
 #include "../utils/searcher_gpu_utils.hpp"
 #include "searcher_gpu.cuh"
 #include "searcher_gpu_common.cuh"
 
 #include <raft/matrix/detail/select_warpsort.cuh>
 #include <raft/matrix/select_k.cuh>
+
+#include <cub/block/block_reduce.cuh>
 
 #include <thrust/fill.h>
 
@@ -1474,7 +1476,7 @@ __global__ void findQueryRanges(const float* __restrict__ queries,
 
   const float* query = queries + query_idx * num_dimensions;
 
-  typedef cub::BlockReduce<float, 256> BlockReduceFloat;
+  using BlockReduceFloat = cub::BlockReduce<float, 256>;
   __shared__ typename BlockReduceFloat::TempStorage temp_storage_min;
   __shared__ typename BlockReduceFloat::TempStorage temp_storage_max;
 
@@ -1770,7 +1772,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   std::optional<size_t> max_probed_vectors_count =
     use_block_sort ? std::nullopt : std::optional<size_t>{0};
 
-  // call utility function to evalate max_cluster_size and max_probed_vectors_count
+  // call utility function to evaluate max_cluster_size and max_probed_vectors_count
   get_max_probed_cluster_size_and_vectors_count(handle_,
                                                 d_sorted_pairs,
                                                 num_queries * nprobe,
@@ -1791,8 +1793,10 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                d_topk_dists.data_handle() + total_elements,
                std::numeric_limits<float>::infinity());
 
-  RAFT_CUDA_TRY(
-    cudaMemsetAsync(d_query_write_counters.data_handle(), 0, num_queries * sizeof(int), stream_));
+  thrust::fill(thrust::cuda::par.on(stream_),
+               d_query_write_counters.data_handle(),
+               d_query_write_counters.data_handle() + num_queries,
+               0);
 
   if (use_block_sort) {
     thrust::fill(thrust::cuda::par.on(stream_),

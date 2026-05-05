@@ -5,9 +5,9 @@
 
 #include "ivf_rabitq/gpu_index/ivf_gpu.cuh"
 #include "ivf_rabitq/gpu_index/searcher_gpu.cuh"
+#include <cuvs/cluster/kmeans.hpp>
 #include <cuvs/neighbors/ivf_rabitq.hpp>
 
-#include "../cluster/kmeans_balanced.cuh"
 #include "../core/nvtx.hpp"
 #include "detail/ann_utils.cuh"
 
@@ -17,8 +17,6 @@
 #include <raft/matrix/sample_rows.cuh>
 #include <raft/util/cudart_utils.hpp>
 
-#include "../cluster/kmeans_balanced_impl_fit_predict.cuh"
-
 namespace cuvs::neighbors::ivf_rabitq {
 
 namespace detail {
@@ -26,10 +24,10 @@ namespace detail {
 using namespace cuvs::spatial::knn::detail;  // NOLINT
 
 template <typename T, typename IdxT, typename accessor>
-void build(raft::resources const& handle,
+auto build(raft::resources const& handle,
            const index_params& params,
-           raft::mdspan<const T, raft::matrix_extent<IdxT>, raft::row_major, accessor> dataset,
-           cuvs::neighbors::ivf_rabitq::index<int64_t>* index)
+           raft::mdspan<const T, raft::matrix_extent<IdxT>, raft::row_major, accessor> dataset)
+  -> cuvs::neighbors::ivf_rabitq::index<IdxT>
 {
   IdxT n_rows = dataset.extent(0);
   IdxT dim    = dataset.extent(1);
@@ -40,31 +38,61 @@ void build(raft::resources const& handle,
   RAFT_EXPECTS(n_rows > 0 && dim > 0, "empty dataset");
   RAFT_EXPECTS(n_rows >= params.n_lists, "number of rows can't be less than n_lists");
 
-  rmm::device_async_resource_ref device_memory = raft::resource::get_workspace_resource(handle);
+  // Calculate dataset size and available workspace once
+  size_t dataset_bytes             = sizeof(T) * n_rows * dim;
+  size_t available_workspace       = raft::resource::get_workspace_free_bytes(handle);
+  constexpr size_t kTolerableRatio = 4;
+
+  rmm::device_async_resource_ref device_memory = raft::resource::get_workspace_resource_ref(handle);
   // If the dataset is small enough to comfortably fit into device memory, put it there.
   // Otherwise, use the managed memory.
-  constexpr size_t kTolerableRatio = 4;
   rmm::device_async_resource_ref big_memory_resource =
-    raft::resource::get_large_workspace_resource(handle);
-  if (sizeof(T) * n_rows * dim * kTolerableRatio <
-      raft::resource::get_workspace_free_bytes(handle)) {
+    raft::resource::get_large_workspace_resource_ref(handle);
+  if (dataset_bytes * kTolerableRatio < available_workspace) {
     big_memory_resource = device_memory;
   }
 
   auto stream = raft::resource::get_cuda_stream(handle);
-  // create device view of dataset
+
+  // Determine if we should use streaming construction
+  bool use_streaming            = false;
+  const float* host_dataset_ptr = nullptr;
+
+  // Check if dataset is already on device
+  auto dataset_residency = utils::check_pointer_residency(dataset.data_handle());
+  bool dataset_on_device = (dataset_residency == utils::pointer_residency::device_only);
+
+  // If dataset is on host, check if we should use streaming construction
+  if (!dataset_on_device) {
+    // Use streaming if explicitly requested or if dataset doesn't fit comfortably
+    if (params.force_streaming || dataset_bytes * kTolerableRatio >= available_workspace) {
+      use_streaming    = true;
+      host_dataset_ptr = dataset.data_handle();
+      if (params.force_streaming) {
+        RAFT_LOG_INFO(
+          "Using streaming construction: explicitly requested via force_streaming parameter");
+      } else {
+        RAFT_LOG_INFO(
+          "Using streaming construction: dataset size (%.2f GB) exceeds comfortable GPU memory "
+          "limit",
+          dataset_bytes / (1024.0 * 1024.0 * 1024.0));
+      }
+    }
+  }
+
+  // create device view of dataset (only if not using streaming)
   auto d_dataset_array =
     raft::make_device_mdarray<T>(handle, big_memory_resource, raft::make_extents<int64_t>(0, 0));
   auto d_dataset_view =
     raft::make_mdspan(dataset.data_handle(), raft::make_extents<int64_t>(n_rows, dim));
-  if (utils::check_pointer_residency(dataset.data_handle()) !=
-      utils::pointer_residency::device_only) {
+
+  if (!use_streaming && !dataset_on_device) {
     try {
       d_dataset_array = raft::make_device_mdarray<T>(
         handle, big_memory_resource, raft::make_extents<int64_t>(n_rows, dim));
     } catch (raft::logic_error& e) {
       RAFT_LOG_ERROR(
-        "Insufficient memory for kmeans clustering. Please decrease "
+        "Insufficient memory for full GPU construction. Please decrease "
         "dataset size, or set large_workspace_resource appropriately.");
       throw;
     }
@@ -75,49 +103,28 @@ void build(raft::resources const& handle,
   auto dataset_const_view = raft::make_const_mdspan(d_dataset_view);
   rmm::device_uvector<float> cluster_centers(params.n_lists * dim, stream, device_memory);
   rmm::device_uvector<uint32_t> labels(n_rows, stream, big_memory_resource);
+
   // Scope for kmeans training set allocation.
   {
     raft::random::RngState random_state{137};
-    auto trainset_ratio = std::max<size_t>(
-      1,
-      size_t(n_rows) / std::max<size_t>(params.kmeans_trainset_fraction * n_rows, params.n_lists));
-    size_t n_rows_train = n_rows / trainset_ratio;
+    size_t n_rows_train =
+      std::min(static_cast<size_t>(n_rows),
+               static_cast<size_t>(params.max_train_points_per_cluster) * params.n_lists);
 
     // Besides just sampling, we transform the input dataset into floats to make it easier
     // to use gemm operations from cublas.
     auto trainset =
       raft::make_device_mdarray<T>(handle, big_memory_resource, raft::make_extents<int64_t>(0, 0));
     try {
-      trainset = raft::make_device_mdarray<float>(
+      trainset = raft::make_device_mdarray<T>(
         handle, big_memory_resource, raft::make_extents<int64_t>(n_rows_train, dim));
     } catch (raft::logic_error& e) {
       RAFT_LOG_ERROR(
         "Insufficient memory for kmeans training set allocation. Please decrease "
-        "kmeans_trainset_fraction, or set large_workspace_resource appropriately.");
+        "max_train_points_per_cluster, or set large_workspace_resource appropriately.");
       throw;
     }
-    // TODO: a proper sampling
-    if constexpr (std::is_same_v<T, float>) {
-      raft::matrix::sample_rows<T, int64_t>(handle, random_state, dataset, trainset.view());
-    } else {
-      raft::common::nvtx::range<cuvs::common::nvtx::domain::cuvs> fun_scope(
-        "   ivf_rabitq::build(%zu, %zu)/sample rows with tmp trainset (%zu rows).",
-        size_t(n_rows),
-        size_t(dim),
-        size_t(n_rows_train));
-
-      // TODO(tfeher): Enable codebook generation with any type T, and then remove trainset tmp.
-      auto trainset_tmp = raft::make_device_mdarray<T>(
-        handle, big_memory_resource, raft::make_extents<int64_t>(n_rows_train, dim));
-
-      raft::matrix::sample_rows<T, int64_t>(handle, random_state, dataset, trainset_tmp.view());
-
-      raft::linalg::unaryOp(trainset.data_handle(),
-                            trainset_tmp.data_handle(),
-                            trainset.size(),
-                            utils::mapping<float>{},
-                            stream);
-    }
+    raft::matrix::sample_rows<T, int64_t>(handle, random_state, dataset, trainset.view());
 
     // perform k-means clustering
     // NB: here cluster_centers is used as if it is [n_clusters, data_dim] not [n_clusters,
@@ -129,9 +136,6 @@ void build(raft::resources const& handle,
     kmeans_params.metric  = cuvs::distance::DistanceType::L2Expanded;
     // find cluster labels for dataset vectors
     auto labels_view = raft::make_device_vector_view<uint32_t, int64_t>(labels.data(), n_rows);
-    // cuvs::cluster::kmeans_balanced::fit_predict(
-    //   handle, kmeans_params, raft::make_const_mdspan(trainset.view()), centers_view,
-    //   labels_view);
     auto centers_const_view = raft::make_device_matrix_view<const float, int64_t>(
       cluster_centers.data(), params.n_lists, dim);
     cuvs::cluster::kmeans::fit(
@@ -140,9 +144,23 @@ void build(raft::resources const& handle,
       handle, kmeans_params, dataset_const_view, centers_const_view, labels_view);
   }
 
-  // Call RaBitQ index construct
-  index->rabitq_index().construct_on_gpu(
-    d_dataset_view.data_handle(), cluster_centers.data(), labels.data(), params.fast_quantize_flag);
+  index<IdxT> index(handle, n_rows, dim, params.n_lists, params.bits_per_dim);
+
+  // Call RaBitQ index construct - use streaming if dataset doesn't fit in GPU memory
+  if (use_streaming) {
+    index.rabitq_index().construct_on_gpu_streaming(host_dataset_ptr,
+                                                    cluster_centers.data(),
+                                                    labels.data(),
+                                                    params.fast_quantize_flag,
+                                                    params.streaming_batch_size);
+  } else {
+    index.rabitq_index().construct_on_gpu(d_dataset_view.data_handle(),
+                                          cluster_centers.data(),
+                                          labels.data(),
+                                          params.fast_quantize_flag);
+  }
+
+  return index;
 }
 
 template <typename T, typename IdxT>
@@ -250,7 +268,7 @@ template <typename IdxT>
 void serialize(raft::resources const& handle, const std::string& filename, index<IdxT>& index)
 {
   // Save the index to a file.
-  index.rabitq_index().save(filename.c_str(), /* save_batch_flag = */ true);
+  index.rabitq_index().save(filename.c_str());
 }
 
 template <typename IdxT>
@@ -279,16 +297,9 @@ index<IdxT>::index(raft::resources const& handle,
                    uint32_t dim,
                    uint32_t n_lists,
                    uint32_t bits_per_dim)
-  : rabitq_index_(std::make_unique<detail::IVFGPU>(
-      handle, n_rows, dim, n_lists, bits_per_dim, /* batch_flag = */ true))
+  : rabitq_index_(std::make_unique<detail::IVFGPU>(handle, n_rows, dim, n_lists, bits_per_dim))
 {
   RAFT_EXPECTS(bits_per_dim >= 1 && bits_per_dim <= 9, "Unsupported bits_per_dim");
-}
-
-template <typename IdxT>
-index<IdxT>::index(raft::resources const& handle, const index_params& params, uint32_t dim)
-  : index(handle)
-{
 }
 
 template <typename IdxT>
@@ -320,20 +331,20 @@ IdxT index<IdxT>::size() const noexcept
   return rabitq_index_->get_num_vectors();
 }
 
-void build(raft::resources const& handle,
+auto build(raft::resources const& handle,
            const cuvs::neighbors::ivf_rabitq::index_params& index_params,
-           raft::device_matrix_view<const float, int64_t, raft::row_major> dataset,
-           cuvs::neighbors::ivf_rabitq::index<int64_t>* idx)
+           raft::device_matrix_view<const float, int64_t, raft::row_major> dataset)
+  -> cuvs::neighbors::ivf_rabitq::index<int64_t>
 {
-  cuvs::neighbors::ivf_rabitq::detail::build(handle, index_params, dataset, idx);
+  return cuvs::neighbors::ivf_rabitq::detail::build(handle, index_params, dataset);
 }
 
-void build(raft::resources const& handle,
+auto build(raft::resources const& handle,
            const cuvs::neighbors::ivf_rabitq::index_params& index_params,
-           raft::host_matrix_view<const float, int64_t, raft::row_major> dataset,
-           cuvs::neighbors::ivf_rabitq::index<int64_t>* idx)
+           raft::host_matrix_view<const float, int64_t, raft::row_major> dataset)
+  -> cuvs::neighbors::ivf_rabitq::index<int64_t>
 {
-  cuvs::neighbors::ivf_rabitq::detail::build(handle, index_params, dataset, idx);
+  return cuvs::neighbors::ivf_rabitq::detail::build(handle, index_params, dataset);
 }
 
 void search(raft::resources const& handle,
