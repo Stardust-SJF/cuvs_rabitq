@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2023-2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2023-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -191,6 +191,9 @@ void parse_build_param(const nlohmann::json& conf,
 {
   if (conf.contains("nlist")) { param.n_lists = conf.at("nlist"); }
   if (conf.contains("niter")) { param.kmeans_n_iters = conf.at("niter"); }
+  if (conf.contains("ratio")) {
+    param.kmeans_trainset_fraction = 1.0 / static_cast<double>(conf.at("ratio"));
+  }
   if (conf.contains("bits_per_dim")) { param.bits_per_dim = conf.at("bits_per_dim"); }
   if (conf.contains("fast_quantize_flag")) {
     param.fast_quantize_flag = conf.at("fast_quantize_flag");
@@ -249,6 +252,23 @@ inline void parse_build_param(const nlohmann::json& conf, cuvs::neighbors::vpq_p
   }
   if (conf.contains("pq_kmeans_trainset_fraction")) {
     param.pq_kmeans_trainset_fraction = conf.at("pq_kmeans_trainset_fraction");
+  }
+  if (conf.contains("pq_kmeans_type")) {
+    std::string type = conf.at("pq_kmeans_type");
+    if (type == "KMeans") {
+      param.pq_kmeans_type = cuvs::cluster::kmeans::kmeans_type::KMeans;
+    } else if (type == "KMeansBalanced") {
+      param.pq_kmeans_type = cuvs::cluster::kmeans::kmeans_type::KMeansBalanced;
+    } else {
+      throw std::runtime_error("pq_kmeans_type: '" + type +
+                               "', should be either 'KMeans' or 'KMeansBalanced'");
+    }
+  }
+  if (conf.contains("max_train_points_per_pq_code")) {
+    param.max_train_points_per_pq_code = conf.at("max_train_points_per_pq_code");
+  }
+  if (conf.contains("max_train_points_per_vq_cluster")) {
+    param.max_train_points_per_vq_cluster = conf.at("max_train_points_per_vq_cluster");
   }
 }
 

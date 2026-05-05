@@ -8,6 +8,7 @@
 //
 
 // This file implements `SearcherGPU::SearchClusterQueryPairsSharedMemOpt`.
+#include "../../detail/smem_utils.cuh"
 #include "../../ivf_flat/ivf_flat_interleaved_scan.cuh"
 #include "../utils/searcher_gpu_utils.hpp"
 #include "searcher_gpu.cuh"
@@ -1077,10 +1078,11 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
           (size_t)queue_buffer_smem_bytes);
     auto kernel =
       use_block_sort ? computeInnerProductsWithLUT16OptBlockSort : computeInnerProductsWithLUT16Opt;
-    // Note that for large dimensions, we need to set it for specific kernel
-    RAFT_CUDA_TRY(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
-    kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+    auto const& kernel_launcher = [&](auto const& kernel) -> void {
+      kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+    };
+    cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
+      kernel, shared_mem_size, kernel_launcher);
   } else {
     size_t first_part_shared_mem = lut_size / num_queries;
     size_t second_part_shared_mem =
@@ -1088,12 +1090,13 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
     // queue buffer reuses first 2 parts
     size_t shared_mem_size =
       max(first_part_shared_mem + second_part_shared_mem, (size_t)queue_buffer_smem_bytes);
-    auto kernel = use_block_sort ? computeInnerProductsWithLUT16OptNoEXBlockSort
-                                 : computeInnerProductsWithLUT16OptNoEX;
-    // Note that for large dimensions, we need to set it for specific kernel
-    RAFT_CUDA_TRY(
-      cudaFuncSetAttribute(kernel, cudaFuncAttributeMaxDynamicSharedMemorySize, shared_mem_size));
-    kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+    auto kernel                 = use_block_sort ? computeInnerProductsWithLUT16OptNoEXBlockSort
+                                                 : computeInnerProductsWithLUT16OptNoEX;
+    auto const& kernel_launcher = [&](auto const& kernel) -> void {
+      kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+    };
+    cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
+      kernel, shared_mem_size, kernel_launcher);
   }
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 

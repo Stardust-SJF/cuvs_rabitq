@@ -1,5 +1,5 @@
 /*
- * SPDX-FileCopyrightText: Copyright (c) 2025, NVIDIA CORPORATION.
+ * SPDX-FileCopyrightText: Copyright (c) 2025-2026, NVIDIA CORPORATION.
  * SPDX-License-Identifier: Apache-2.0
  */
 
@@ -36,8 +36,7 @@ struct index_params : cuvs::neighbors::index_params {
   /**
    * The number of inverted lists (clusters)
    *
-   * Hint: the number of vectors per cluster (`n_rows/n_lists`) should be approximately 1,000 to
-   * 10,000.
+   * Hint: Increasing this parameter may alleviate shared memory pressure.
    */
   uint32_t n_lists = 1024;
   /**
@@ -52,6 +51,8 @@ struct index_params : cuvs::neighbors::index_params {
   uint32_t bits_per_dim = 3;
   /** The number of iterations searching for kmeans centers (index building). */
   uint32_t kmeans_n_iters = 20;
+  /** The fraction of data to use during iterative kmeans building. */
+  double kmeans_trainset_fraction = 0.5;
   /** Flag for using the fast quantize method */
   bool fast_quantize_flag = false;
 };
@@ -129,6 +130,9 @@ struct index : cuvs::neighbors::index {
   /** Dimensionality of the input data. */
   uint32_t dim() const noexcept;
 
+  /** Total length of the index. */
+  IdxT size() const noexcept;
+
   /** Accessor for underlying RaBitQ index */
   detail::IVFGPU& rabitq_index() noexcept;
 
@@ -158,7 +162,7 @@ struct index : cuvs::neighbors::index {
  *
  * @param[in] handle
  * @param[in] index_params configure the index building
- * @param[in] dataset a host_matrix_view to a row-major matrix [n_rows, dim]
+ * @param[in] dataset a device_matrix_view to a row-major matrix [n_rows, dim]
  * @param[out] idx reference to ivf_rabitq::index
  *
  */
@@ -167,6 +171,29 @@ void build(raft::resources const& handle,
            raft::device_matrix_view<const float, int64_t, raft::row_major> dataset,
            cuvs::neighbors::ivf_rabitq::index<int64_t>* idx);
 
+/**
+ * @brief Build the index from the dataset for efficient search.
+ *
+ * Usage example:
+ * @code{.cpp}
+ *   using namespace cuvs::neighbors;
+ *   // use default index parameters
+ *   ivf_rabitq::index_params index_params;
+ *   // create and fill the index from a [N, D] dataset
+ *   cuvs::neighbors::ivf_rabitq::index<int64_t> index;
+ *   ivf_rabitq::build(handle, index_params, dataset, &index);
+ * @endcode
+ *
+ * @param[in] handle
+ * @param[in] index_params configure the index building
+ * @param[in] dataset a host_matrix_view to a row-major matrix [n_rows, dim]
+ * @param[out] idx reference to ivf_rabitq::index
+ *
+ */
+void build(raft::resources const& handle,
+           const cuvs::neighbors::ivf_rabitq::index_params& index_params,
+           raft::host_matrix_view<const float, int64_t, raft::row_major> dataset,
+           cuvs::neighbors::ivf_rabitq::index<int64_t>* idx);
 /**
  * @}
  */
