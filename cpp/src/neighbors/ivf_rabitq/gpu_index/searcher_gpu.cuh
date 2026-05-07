@@ -21,12 +21,16 @@
 
 namespace cuvs::neighbors::ivf_rabitq::detail {
 
-#define MAX_TOP_K_BLOCK_SORT \
-  64  // the search implementation performs block-level sorting if topk <= MAX_TOP_K_BLOCK_SORT;
-      // otherwise block sort is not used. must be power of 2; increases shared mem usage
+// block-level sorting used if topk <= kMaxTopKBlockSort; must be power of 2; increases shared mem
+// usage
+static constexpr int kMaxTopKBlockSort = 64;
 
 class SearcherGPU {
  public:
+  /**
+   * @param d vector dimension; must be divisible by 32 and by BITS_PER_CHUNK. Pass the padded
+   *          dimension (e.g. IVFGPU::get_num_padded_dim()), not the raw dataset dimension.
+   */
   explicit SearcherGPU(raft::resources const& handle,
                        const float* q,
                        size_t d,
@@ -62,22 +66,7 @@ class SearcherGPU {
     unit_q_ = std::unique_ptr<float, decltype(std::free)*>(unit_q, std::free);
   }  // unit_q must be allocated with `malloc` or similar, as opposed to `new`
 
-  /**
-   * @brief Function to Search <cluster_id, query_id> pairs
-   * @param cur_ivf
-   * @param d_cluster_meta
-   * @param d_sorted_pairs
-   * @param num_queries
-   * @param d_query
-   * @param d_G_k1xSumq
-   * @param d_G_kbxSumq
-   * @param all_topk_results
-   * @param h_query
-   * @param nprobe
-   * @param d_centroid
-   * @param topk
-   * @param stream
-   */
+  /** @brief Search <cluster_id, query_id> pairs */
   void SearchClusterQueryPairs(const IVFGPU& cur_ivf,
                                IVFGPU::GPUClusterMeta* d_cluster_meta,
                                ClusterQueryPair* d_sorted_pairs,
