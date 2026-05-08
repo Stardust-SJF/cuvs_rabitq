@@ -66,6 +66,11 @@ class RotatorGPU {
   // This function computes: RAND_A = A * P using cuBLAS.
   void rotate(const float* d_A, float* d_RAND_A, size_t N) const;
 
+  // Whether this rotator can rotate in place (input and output may alias).
+  // cuBLAS GEMM has undefined behavior when input and output overlap, so the
+  // matmul rotator returns false. Other rotators (e.g. FHT-Kac) may override.
+  bool supports_inplace_rotate() const { return false; }
+
  private:
   raft::resources const& handle_;  // reusable resource handle
   rmm::cuda_stream_view stream_ =

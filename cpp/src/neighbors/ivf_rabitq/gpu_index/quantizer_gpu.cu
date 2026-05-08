@@ -322,16 +322,18 @@ __global__ void pack_and_compute_factors_kernel(
   // before potentially reusing registers for packing. A sync is good practice here.
   __syncthreads();
 
-  // Each thread processes one or more blocks of 32 bits for the current row.
+  // Coalesced read + warp-cooperative pack: each warp packs one 32-bit word
+  // by reading 32 bits in parallel (lane i reads bit i), then __ballot_sync
+  // gathers the bits into a single uint32 (with __brev to put bit i at
+  // position 31-i, matching the original layout).
   size_t blocks_per_point = D / 32;
-  for (size_t block_id = threadIdx.x; block_id < blocks_per_point; block_id += blockDim.x) {
-    uint32_t cur = 0;
-    // Process 32 bits for this block_id
-    for (int i = 0; i < 32; i++) {
-      int bit = d_bin_XP[row * D + block_id * 32 + i];
-      cur |= ((uint32_t)bit << (31 - i));
-    }
-    d_packed_code[row * blocks_per_point + block_id] = cur;
+  size_t lane             = threadIdx.x % 32;
+  size_t warp_id          = threadIdx.x / 32;
+  size_t num_warps        = blockDim.x / 32;
+  for (size_t block_id = warp_id; block_id < blocks_per_point; block_id += num_warps) {
+    int bit         = d_bin_XP[row * D + block_id * 32 + lane];
+    uint32_t packed = __brev(__ballot_sync(0xFFFFFFFF, bit));
+    if (lane == 0) { d_packed_code[row * blocks_per_point + block_id] = packed; }
   }
 }
 
@@ -517,31 +519,36 @@ void data_transformation_batch_opt(const float* d_data,
                                    size_t D,
                                    rmm::cuda_stream_view stream)
 {
-  // 1. Allocate a single temporary buffer for both padded data and the padded centroid.
+  // Choose gather target: rotators that support in-place rotation (e.g. FHT-Kac)
+  // gather straight into d_XP_output and rotate in place, skipping d_X_and_C_pad
+  // entirely. The matmul rotator uses cuBLAS GEMM which does not allow
+  // input/output aliasing, so it gathers into d_X_and_C_pad and rotates from
+  // there into d_XP_output.
+  const bool inplace = rotator.supports_inplace_rotate();
+  float* d_pad_buf   = inplace ? d_XP_output : d_X_and_C_pad;
 
-  // 2. Launch a single kernel to gather and pad both data and centroid.
+  // 1. Gather + pad both data rows and the centroid into d_pad_buf.
   int blockSize           = D < 256 ? 128 : 256;
   size_t totalPadElements = (num_points + 1) * D;
   int gridPadSize         = (totalPadElements + blockSize - 1) / blockSize;
   gatherAndPadKernel<<<gridPadSize, blockSize, 0, stream>>>(
-    d_data, d_IDs, d_centroid, d_X_and_C_pad, num_points, DIM, D);
+    d_data, d_IDs, d_centroid, d_pad_buf, num_points, DIM, D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-  // 3. Allocate a single output buffer for both rotated data (XP) and rotated centroid (CP).
+  // 2. Rotate all (num_points + 1) vectors. With in-place support the rotator
+  // aliases input == output == d_XP_output; otherwise rotate from d_pad_buf
+  // into d_XP_output.
   float* d_XP_and_CP = d_XP_output;
-
-  // 4. Perform a single, combined rotation.
-  // The input is d_X_and_C_pad, output is d_XP_and_CP. The number of "points" is num_points + 1.
-  rotator.rotate(d_X_and_C_pad, d_XP_and_CP, num_points + 1);
+  rotator.rotate(d_pad_buf, d_XP_and_CP, num_points + 1);
 
   // Create pointers to the specific results within the combined buffer.
   float* d_XP = d_XP_and_CP;
   float* d_CP = d_XP_and_CP + num_points * D;
 
-  // 5. Save the rotated centroid: copy CP into d_rotated_c.
+  // 3. Save the rotated centroid: copy CP into d_rotated_c.
   raft::copy(d_rotated_c, d_CP, D, stream);
 
-  // 6. Launch the single FUSED kernel for subtract, normalize, and binarize.
+  // 4. Launch the single FUSED kernel for subtract, normalize, and binarize.
   const unsigned int FusedBlockSize = 256;  // A good default, can be tuned.
   dim3 gridDim(num_points);
   dim3 blockDim(FusedBlockSize);
@@ -753,22 +760,26 @@ void data_transformation_batch_opt_contiguous(const float* d_contiguous_data,
                                               size_t D,
                                               rmm::cuda_stream_view stream)
 {
-  // 1. Allocate a single temporary buffer for both padded data and the padded centroid.
+  // Choose copy target: rotators that support in-place rotation (e.g. FHT-Kac)
+  // write straight into d_XP_output and rotate in place, skipping d_X_and_C_pad
+  // entirely. cuBLAS GEMM forbids input/output aliasing, so the matmul rotator
+  // copies into d_X_and_C_pad and rotates into d_XP_output.
+  const bool inplace = rotator.supports_inplace_rotate();
+  float* d_pad_buf   = inplace ? d_XP_output : d_X_and_C_pad;
 
-  // 2. Launch a single kernel to copy, pad, and add centroid.
+  // 1. Launch a single kernel to copy, pad, and add centroid.
   int blockSize           = D < 256 ? 128 : 256;
   size_t totalPadElements = (num_points + 1) * D;
   int gridPadSize         = (totalPadElements + blockSize - 1) / blockSize;
   copyAndPadContiguousWithCentroidKernel<<<gridPadSize, blockSize, 0, stream>>>(
-    d_contiguous_data, d_centroid, d_X_and_C_pad, num_points, DIM, D);
+    d_contiguous_data, d_centroid, d_pad_buf, num_points, DIM, D);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
-  // 3. Allocate a single output buffer for both rotated data (XP) and rotated centroid (CP).
+  // 2. Rotate all (num_points + 1) vectors. With in-place support the rotator
+  // aliases input == output == d_XP_output; otherwise rotate from d_pad_buf
+  // into d_XP_output.
   float* d_XP_and_CP = d_XP_output;
-
-  // 4. Perform a single, combined rotation.
-  // The input is d_X_and_C_pad, output is d_XP_and_CP. The number of "points" is num_points + 1.
-  rotator.rotate(d_X_and_C_pad, d_XP_and_CP, num_points + 1);
+  rotator.rotate(d_pad_buf, d_XP_and_CP, num_points + 1);
 
   // Create pointers to the specific results within the combined buffer.
   float* d_XP = d_XP_and_CP;
@@ -990,6 +1001,10 @@ __device__ float compute_best_rescale_parallel(
   constexpr float kEps = 1e-5f;
   constexpr int kNEnum = 10;
 
+  // EX_BITS == 0 is the 1-bit case: the code is purely sign-driven and the
+  // scale t is irrelevant, so skip the rescale search entirely.
+  if (EX_BITS == 0) return 1.0f;
+
   //=========================================================================
   // Step 1: Find maximum value using parallel reduction
   //=========================================================================
@@ -1077,7 +1092,9 @@ __device__ float compute_best_rescale_parallel(
   float fine_start = fmaxf(t_start, center_t - range);
   float fine_end   = fminf(t_end, center_t + range);
 
-  const int FINE_SAMPLES = 32;
+  // 64 samples (raised from 32) better matches v2.1/v2.2 accuracy while
+  // retaining the v2.3/v2.4 speedup.
+  const int FINE_SAMPLES = 64;
   float best_fine_ip     = 0.0f;
   float best_fine_t      = center_t;
 
