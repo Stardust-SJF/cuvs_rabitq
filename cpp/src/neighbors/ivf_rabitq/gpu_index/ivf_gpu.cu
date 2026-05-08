@@ -1296,6 +1296,8 @@ void IVFGPU::PrepareClusterSearchInputs(
                              num_padded_dim,
                              ex_bits,
                              stream_);
+
+  raft::resource::sync_stream(handle_);
 }
 
 void IVFGPU::BatchClusterSearch(const float* d_query,
