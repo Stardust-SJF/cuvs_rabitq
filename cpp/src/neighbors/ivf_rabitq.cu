@@ -144,7 +144,7 @@ auto build(raft::resources const& handle,
       handle, kmeans_params, dataset_const_view, centers_const_view, labels_view);
   }
 
-  index<IdxT> index(handle, n_rows, dim, params.n_lists, params.bits_per_dim);
+  index<IdxT> index(handle, n_rows, dim, params.n_lists, params.bits_per_dim, params.rotator);
 
   // Call RaBitQ index construct - use streaming if dataset doesn't fit in GPU memory
   if (use_streaming) {
@@ -312,10 +312,12 @@ index<IdxT>::index(raft::resources const& handle,
                    size_t n_rows,
                    uint32_t dim,
                    uint32_t n_lists,
-                   uint32_t bits_per_dim)
+                   uint32_t bits_per_dim,
+                   rotator_kind rotator)
 {
   RAFT_EXPECTS(bits_per_dim >= 1 && bits_per_dim <= 9, "Unsupported bits_per_dim");
-  rabitq_index_ = std::make_unique<detail::IVFGPU>(handle, n_rows, dim, n_lists, bits_per_dim);
+  rabitq_index_ =
+    std::make_unique<detail::IVFGPU>(handle, n_rows, dim, n_lists, bits_per_dim, rotator);
 }
 
 template <typename IdxT>

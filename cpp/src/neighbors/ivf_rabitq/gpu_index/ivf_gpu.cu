@@ -32,7 +32,12 @@
 
 namespace cuvs::neighbors::ivf_rabitq::detail {
 
-IVFGPU::IVFGPU(raft::resources const& handle, size_t n, size_t dim, size_t k, size_t bits_per_dim)
+IVFGPU::IVFGPU(raft::resources const& handle,
+               size_t n,
+               size_t dim,
+               size_t k,
+               size_t bits_per_dim,
+               rotator_kind rotator)
   : handle_(handle),
     num_vectors(n),
     num_dimensions(dim),
@@ -41,7 +46,7 @@ IVFGPU::IVFGPU(raft::resources const& handle, size_t n, size_t dim, size_t k, si
     ex_bits(bits_per_dim - 1),
     initializer(nullptr),
     DQ(std::make_unique<DataQuantizerGPU>(handle_, dim, bits_per_dim - 1)),
-    Rota(std::make_unique<RotatorGPU>(handle_, dim))
+    Rota(std::make_unique<RotatorGPU>(handle_, dim, rotator))
 {
 }
 

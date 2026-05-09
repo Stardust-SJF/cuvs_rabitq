@@ -199,6 +199,16 @@ void parse_build_param(const nlohmann::json& conf,
     param.fast_quantize_flag = conf.at("fast_quantize_flag");
   }
   if (conf.contains("force_streaming")) { param.force_streaming = conf.at("force_streaming"); }
+  if (conf.contains("rotator")) {
+    std::string rotator = conf.at("rotator");
+    if (rotator == "matmul") {
+      param.rotator = cuvs::neighbors::ivf_rabitq::rotator_kind::matmul;
+    } else if (rotator == "fht_kac") {
+      param.rotator = cuvs::neighbors::ivf_rabitq::rotator_kind::fht_kac;
+    } else {
+      throw std::runtime_error("rotator: '" + rotator + "', should be 'matmul' or 'fht_kac'");
+    }
+  }
 }
 
 template <typename T, typename IdxT>

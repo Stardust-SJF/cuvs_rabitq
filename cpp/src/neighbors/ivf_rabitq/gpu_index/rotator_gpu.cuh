@@ -11,6 +11,8 @@
 
 #include "../defines.hpp"
 
+#include <cuvs/neighbors/ivf_rabitq.hpp>
+
 #include <raft/core/device_mdarray.hpp>
 #include <raft/core/mdspan_types.hpp>
 #include <raft/core/resources.hpp>
@@ -22,62 +24,83 @@
 
 namespace cuvs::neighbors::ivf_rabitq::detail {
 
-// The RotatorGPU class holds a rotation matrix (P) on the GPU. The matrix is computed
-// on the CPU (using Eigen, similar to your CPU code) and then copied to device memory.
-// The rotate() function uses cuBLAS to compute the product: RAND_A = A * P.
-// It is assumed that A and RAND_A reside in GPU memory.
+/// Unified GPU rotator supporting both matrix multiplication and FHT+Kac.
+///
+/// The rotator kind is chosen at construction time and persisted on save/load.
+/// All callers use the same rotate()/save()/load() interface regardless of the
+/// underlying implementation.
 class RotatorGPU {
- public: /**
-          * @brief Construct a new RotatorGPU object.
-          * @param dim The original dimension; the padded dimension D is computed as
-          * rd_up_to_multiple_of(dim, 64).
-          *
-          * The constructor generates a random rotation matrix on the CPU (using Eigen) and then
-          * copies it into                    device memory in column-major order.
-          */
-  explicit RotatorGPU(raft::resources const& handle, uint32_t dim);
+ public:
+  /**
+   * @brief Construct a new RotatorGPU.
+   * @param handle  raft resources handle.
+   * @param dim     Original (unpadded) vector dimension. Padded dimension D is
+   *                round_up_to_multiple_of(dim, 64).
+   * @param kind    Rotator implementation to use.
+   */
+  explicit RotatorGPU(raft::resources const& handle,
+                      uint32_t dim,
+                      rotator_kind kind = rotator_kind::matmul);
 
   // Disable copy assignment
   RotatorGPU& operator=(const RotatorGPU& other) = delete;
 
+  /// @return Padded dimension.
   size_t size() const;
 
+  /// @return The rotator kind.
+  rotator_kind kind() const { return kind_; }
+
   /**
-   * @brief Load the rotation matrix from a file.
-   * @param input Input stream (the file stores the matrix in row-major order).
+   * @brief Load rotator from file.
    *
-   * The function reads the D×D matrix from the file, transposes it into column-major order,
-   * and copies it into device memory.
+   * Reads a one-byte kind tag, then dispatches to the matching loader. If the
+   * file's kind differs from this instance's current kind, the instance is
+   * reinitialised to match.
    */
   void load(std::ifstream& input);
 
   /**
-   * @brief Save the rotation matrix to a file.
-   * @param handle Resource handle
-   * @param output Output stream.
+   * @brief Save rotator to file.
    *
-   * The function copies the rotation matrix from device memory, transposes it from column-major to
-   * row-major, and writes it to the file.
+   * Format: [uint8_t kind_tag] [kind-specific data].
    */
   void save(std::ofstream& output) const;
 
-  // Rotate matrix A and store the result in RAND_A.
-  // A and RAND_A are device pointers representing matrices of size N x D.
-  // This function computes: RAND_A = A * P using cuBLAS.
+  /**
+   * @brief Rotate N vectors of D floats.
+   * @param d_A      Input:  N × D matrix on device (row-major).
+   * @param d_RAND_A Output: N × D matrix on device (row-major).
+   * @param N        Number of vectors.
+   *
+   * In-place aliasing (`d_A == d_RAND_A`) is allowed only when
+   * supports_inplace_rotate() returns true (currently fht_kac only).
+   */
   void rotate(const float* d_A, float* d_RAND_A, size_t N) const;
 
-  // Whether this rotator can rotate in place (input and output may alias).
-  // cuBLAS GEMM has undefined behavior when input and output overlap, so the
-  // matmul rotator returns false. Other rotators (e.g. FHT-Kac) may override.
-  bool supports_inplace_rotate() const { return false; }
+  /// @return True if rotate() may be called with d_A == d_RAND_A.
+  bool supports_inplace_rotate() const { return kind_ == rotator_kind::fht_kac; }
 
  private:
   raft::resources const& handle_;  // reusable resource handle
   rmm::cuda_stream_view stream_ =
     raft::resource::get_cuda_stream(handle_);  // CUDA stream obtained from handle_
-  size_t D;                                    // Padded dimension
+  rotator_kind kind_;
+  size_t D = 0;  // Padded dimension
+
+  // ---- matmul members (used when kind_ == matmul) ----
   raft::device_matrix<float, int64_t, raft::row_major> rotation_matrix_ =
-    raft::make_device_matrix<float, int64_t, raft::row_major>(handle_, 0, 0);  // Rotation matrix P
+    raft::make_device_matrix<float, int64_t, raft::row_major>(handle_, 0, 0);
+
+  // ---- fht_kac members (used when kind_ == fht_kac) ----
+  size_t trunc_dim_ = 0;  // 1 << floor_log2(dim), largest power-of-2 <= dim
+  float fac_        = 0;  // 1 / sqrt(trunc_dim)
+  int log_N_        = 0;  // log2(trunc_dim), for FHT kernel dispatch
+  raft::device_vector<uint8_t, int64_t> flip_bits_ =
+    raft::make_device_vector<uint8_t, int64_t>(handle_, 0);  // 4 * D / 8 bytes of random sign bits
+
+  void init_matmul(uint32_t dim);
+  void init_fht_kac(uint32_t dim);
 };
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

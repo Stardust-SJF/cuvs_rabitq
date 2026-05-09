@@ -32,6 +32,21 @@ class IVFGPU;
  * @defgroup ivf_rabitq_cpp_index_params IVF-RaBitQ index build parameters
  * @{
  */
+
+/**
+ * Random rotation implementation used at index build time.
+ *
+ * The chosen rotator is persisted in the saved index and the same rotation is
+ * applied to queries at search time, so this is a build-time decision only.
+ */
+enum class rotator_kind : uint8_t {
+  /** Full D×D rotation matrix via cuBLAS sgemm. O(N·D²) compute / O(D²) memory. */
+  matmul = 0,
+  /** Fast Hadamard Transform + Kac's walk. O(N·D·log D) compute / O(D) memory.
+   *  No cuBLAS dependency. Recommended for high-dimensional datasets. */
+  fht_kac = 1,
+};
+
 struct index_params : cuvs::neighbors::index_params {
   /**
    * The number of inverted lists (clusters)
@@ -79,6 +94,12 @@ struct index_params : cuvs::neighbors::index_params {
    * Default: false (auto-detect based on available memory)
    */
   bool force_streaming = false;
+  /**
+   * Random rotation implementation. See `rotator_kind` for trade-offs.
+   *
+   * Default: `rotator_kind::matmul` (preserves existing behavior).
+   */
+  rotator_kind rotator = rotator_kind::matmul;
 };
 /**
  * @}
@@ -146,7 +167,8 @@ struct index : cuvs::neighbors::index {
         size_t n_rows,
         uint32_t dim,
         uint32_t n_lists,
-        uint32_t bits_per_dim);
+        uint32_t bits_per_dim,
+        rotator_kind rotator = rotator_kind::matmul);
 
   /** Dimensionality of the input data. */
   uint32_t dim() const noexcept;

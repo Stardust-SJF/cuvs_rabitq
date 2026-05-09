@@ -161,7 +161,12 @@ class IVFGPU {
    * @param k Num of centroids.
    * @param bits_per_dim totalbits = EX_BITS+1
    */
-  IVFGPU(raft::resources const& handle, size_t n, size_t dim, size_t k, size_t bits_per_dim);
+  IVFGPU(raft::resources const& handle,
+         size_t n,
+         size_t dim,
+         size_t k,
+         size_t bits_per_dim,
+         rotator_kind rotator = rotator_kind::matmul);
   IVFGPU(raft::resources const& handle)
     : handle_(handle), initializer(nullptr), Rota(std::make_unique<RotatorGPU>(handle_, 128))
   {
