@@ -294,7 +294,8 @@ class IVFGPU {
                                threshold_strategy strategy = threshold_strategy::centroid_reorder,
                                float centroid_reorder_scale = 1.5f,
                                bool enable_dynamic_block    = true,
-                               uint32_t skip_sort_threshold = 8);
+                               uint32_t skip_sort_threshold = 8,
+                               ip_variant_kind ip_variant   = ip_variant_kind::auto_);
 
   void BatchClusterSearchQuantizeQuery(
     const float* d_query,
@@ -308,7 +309,8 @@ class IVFGPU {
     threshold_strategy strategy   = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale  = 1.5f,
     bool enable_dynamic_block     = true,
-    uint32_t skip_sort_threshold  = 8);
+    uint32_t skip_sort_threshold  = 8,
+    ip_variant_kind ip_variant    = ip_variant_kind::auto_);
 
  private:
   // d_raft_idx_out exposes raft::matrix::select_k's query-major output so that

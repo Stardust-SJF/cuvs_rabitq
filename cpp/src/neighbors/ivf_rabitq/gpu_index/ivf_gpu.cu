@@ -1376,7 +1376,8 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                      threshold_strategy strategy,
                                      float centroid_reorder_scale,
                                      bool enable_dynamic_block,
-                                     uint32_t skip_sort_threshold)
+                                     uint32_t skip_sort_threshold,
+                                     ip_variant_kind ip_variant)
 {
   SearcherGPU* searcher_batch = (SearcherGPU*)searcher;
   auto d_sorted_pairs         = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
@@ -1406,7 +1407,8 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                                       strategy,
                                                       centroid_reorder_scale,
                                                       d_raft_idx.data_handle(),
-                                                      enable_dynamic_block);
+                                                      enable_dynamic_block,
+                                                      ip_variant);
 }
 
 void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
@@ -1420,7 +1422,8 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                              threshold_strategy strategy,
                                              float centroid_reorder_scale,
                                              bool enable_dynamic_block,
-                                             uint32_t skip_sort_threshold)
+                                             uint32_t skip_sort_threshold,
+                                             ip_variant_kind ip_variant)
 {
   SearcherGPU* searcher_batch = (SearcherGPU*)searcher;
   auto d_sorted_pairs         = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
@@ -1451,7 +1454,8 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                                        strategy,
                                                        centroid_reorder_scale,
                                                        d_raft_idx.data_handle(),
-                                                       enable_dynamic_block);
+                                                       enable_dynamic_block,
+                                                       ip_variant);
 }
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

@@ -94,7 +94,8 @@ class SearcherGPU {
     threshold_strategy strategy   = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale  = 1.5f,
     const int* d_raft_idx         = nullptr,
-    bool enable_dynamic_block     = true);
+    bool enable_dynamic_block     = true,
+    ip_variant_kind ip_variant    = ip_variant_kind::auto_);
 
   void SearchClusterQueryPairsQuantizeQuery(
     const IVFGPU& cur_ivf,
@@ -112,7 +113,8 @@ class SearcherGPU {
     threshold_strategy strategy   = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale  = 1.5f,
     const int* d_raft_idx         = nullptr,
-    bool enable_dynamic_block     = true);
+    bool enable_dynamic_block     = true,
+    ip_variant_kind ip_variant    = ip_variant_kind::auto_);
 
  private:
   raft::resources const& handle_;  // reusable resource handle

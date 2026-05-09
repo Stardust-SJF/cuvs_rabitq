@@ -59,6 +59,9 @@ struct ComputeInnerProductsKernelParams {
   int* d_query_write_counters = nullptr;
   uint32_t num_bits           = 0;  // number of bits (8 for int8)
   uint32_t num_words          = 0;  // approx. D/32
+  // Per-block granularity for the candidate-rerank stages. 0=auto (hybrid),
+  // 1=force Path A, 2=force Path B. See cuvs::neighbors::ivf_rabitq::ip_variant_kind.
+  uint8_t ip_variant          = 0;
 };
 
 // function to extract long codes

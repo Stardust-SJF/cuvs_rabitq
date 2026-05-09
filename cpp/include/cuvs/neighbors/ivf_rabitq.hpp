@@ -118,6 +118,24 @@ enum class search_mode {
 };
 
 /**
+ * Per-block granularity for the search kernel's candidate-rerank stages.
+ *
+ * The exact-IP and IP2 stages run after the initial filter has admitted some
+ * subset of vectors per block. With `auto` the kernel dispatches based on
+ * the number of admitted candidates: dense buffers (high `num_candidates`)
+ * use the "thread-per-cand / 1-warp-per-cand" Path A — fast for high ncand
+ * because of coalesced HBM access; sparse buffers (low `num_candidates`) use
+ * the "warp-per-cand / multi-warp-per-cand" Path B — recruits otherwise-idle
+ * warps to share the per-candidate D-dim work. The forced variants are
+ * mostly for ablation.
+ */
+enum class ip_variant_kind : uint8_t {
+  auto_           = 0,  // hybrid dispatch (production default)
+  thread_per_cand = 1,  // force Path A in both stages
+  warp_per_cand   = 2,  // force Path B in both stages
+};
+
+/**
  * Threshold-seeding strategy for the in-kernel topk pruning during search.
  *
  * The search kernel maintains a per-query running max of the topk distances
@@ -160,6 +178,9 @@ struct search_params : cuvs::neighbors::search_params {
    *  query-major order. Empirically helps at small batch / small nprobe
    *  where the sort can't amortise over L2 reuse. Set to 0 to never skip. */
   uint32_t skip_sort_threshold = 8;
+  /** See `ip_variant_kind`. Default `auto_` runs the per-block hybrid
+   *  dispatch; the other values force one path for ablation. */
+  ip_variant_kind ip_variant = ip_variant_kind::auto_;
 };
 /**
  * @}

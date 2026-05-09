@@ -268,14 +268,62 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
     __shared__ int probe_slot;
 
     if constexpr (WithEx) {
-      // Phase 2 (WithEx): Compute exact 1-bit IPs and store for IP2 refinement
-      for (int c = 0; c < candidates_per_thread; ++c) {
-        int cand_idx = tid + c * num_threads;
-        if (cand_idx < num_candidates) {
+      // Phase 2 (WithEx): Compute exact 1-bit IPs and store for IP2 refinement.
+      //
+      // Hybrid granularity dispatched per-block on num_candidates:
+      //   Path A (thread-per-cand): each thread walks one candidate's full
+      //     short_code_length sequentially. Coalesced HBM access across the
+      //     warp's 32 lanes (consecutive vec_idx at fixed word). Fast for
+      //     high ncand.
+      //   Path B (warp-per-cand): each warp processes one candidate; lanes
+      //     split words. Loads are non-coalesced but per-cand volume is tiny.
+      //     Better at low ncand (fewer than 2 * num_warps candidates) so
+      //     warps don't sit idle.
+      // params.ip_variant: 0=auto, 1=force Path A, 2=force Path B.
+      const int num_warps_p2 = num_threads / raft::WarpSize;
+      bool path_a_p2;
+      if (params.ip_variant == 1) {
+        path_a_p2 = true;
+      } else if (params.ip_variant == 2) {
+        path_a_p2 = false;
+      } else {
+        path_a_p2 = static_cast<int>(num_candidates) >= 2 * num_warps_p2;
+      }
+      if (path_a_p2) {
+        // ----- Path A: thread-per-candidate -----
+        for (int c = 0; c < candidates_per_thread; ++c) {
+          int cand_idx = tid + c * num_threads;
+          if (cand_idx < num_candidates) {
+            int vec_idx    = shared_candidate_indices[cand_idx];
+            float exact_ip = 0.0f;
+
+            for (size_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
+              size_t short_code_offset = cluster_start_index * short_code_length +
+                                         uint32_idx * num_vectors_in_cluster + vec_idx;
+              uint32_t short_code_chunk = params.d_short_data[short_code_offset];
+#pragma unroll 8
+              for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
+                size_t dim = uint32_idx * 32 + bit_idx;
+                if (dim < params.D) {
+                  if ((short_code_chunk >> (31 - bit_idx)) & 0x1) {
+                    exact_ip += shared_query[dim];
+                  }
+                }
+              }
+            }
+            shared_candidate_ips[cand_idx] = exact_ip;
+          }
+        }
+      } else {
+        // ----- Path B: warp-per-candidate (branchless multiply-by-bool) -----
+        const int wid = tid / raft::WarpSize;
+        const int lid = tid % raft::WarpSize;
+        for (int cand_idx = wid; cand_idx < static_cast<int>(num_candidates);
+             cand_idx += num_warps_p2) {
           int vec_idx    = shared_candidate_indices[cand_idx];
           float exact_ip = 0.0f;
-
-          for (size_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
+          for (size_t uint32_idx = lid; uint32_idx < short_code_length;
+               uint32_idx += raft::WarpSize) {
             size_t short_code_offset = cluster_start_index * short_code_length +
                                        uint32_idx * num_vectors_in_cluster + vec_idx;
             uint32_t short_code_chunk = params.d_short_data[short_code_offset];
@@ -283,11 +331,16 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
             for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
               size_t dim = uint32_idx * 32 + bit_idx;
               if (dim < params.D) {
-                if ((short_code_chunk >> (31 - bit_idx)) & 0x1) { exact_ip += shared_query[dim]; }
+                float bv = static_cast<float>((short_code_chunk >> (31 - bit_idx)) & 0x1u);
+                exact_ip += bv * shared_query[dim];
               }
             }
           }
-          shared_candidate_ips[cand_idx] = exact_ip;
+#pragma unroll
+          for (int off = raft::WarpSize / 2; off > 0; off /= 2) {
+            exact_ip += __shfl_down_sync(0xFFFFFFFF, exact_ip, off);
+          }
+          if (lid == 0) { shared_candidate_ips[cand_idx] = exact_ip; }
         }
       }
       __syncthreads();
@@ -306,19 +359,84 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
         const int lane_id   = tid % raft::WarpSize;
         const int num_warps = num_threads / raft::WarpSize;
 
-        for (int cand_idx = warp_id; cand_idx < num_candidates; cand_idx += num_warps) {
-          size_t global_vec_idx        = cluster_start_index + shared_candidate_indices[cand_idx];
-          const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
+        // Hybrid granularity for IP2:
+        //   Path A (1-warp-per-cand): each warp owns one candidate's full
+        //     D-dim IP2 across its 32 lanes. Standard at ncand >= num_warps.
+        //   Path B (multi-warp-per-cand): when ncand < num_warps, otherwise-
+        //     idle warps split D among themselves to reduce per-cand wall
+        //     time. Cross-warp partial sums merge through s_ip2_partial.
+        // Forced `warp_per_cand` falls back to Path A when ncand >= num_warps
+        // because Path B's warps_per_cand = num_warps / ncand integer-divides
+        // to 0 in that regime and would skip candidates.
+        bool path_a_ip2;
+        if (params.ip_variant == 1) {
+          path_a_ip2 = true;
+        } else {
+          // auto and forced warp_per_cand both require ncand < num_warps for
+          // Path B to be correct.
+          path_a_ip2 = static_cast<int>(num_candidates) >= num_warps;
+        }
+        if (path_a_ip2) {
+          for (int cand_idx = warp_id; cand_idx < num_candidates; cand_idx += num_warps) {
+            size_t global_vec_idx = cluster_start_index + shared_candidate_indices[cand_idx];
+            const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
 
-          float ip2 = 0.0f;
-          for (uint32_t d = lane_id; d < params.D; d += raft::WarpSize) {
-            ip2 += shared_query[d] * (float)extract_code(vec_long_code, d, params.ex_bits);
-          }
+            float ip2 = 0.0f;
+            for (uint32_t d = lane_id; d < params.D; d += raft::WarpSize) {
+              ip2 += shared_query[d] * (float)extract_code(vec_long_code, d, params.ex_bits);
+            }
 #pragma unroll
-          for (int offset = raft::WarpSize / 2; offset > 0; offset /= 2) {
-            ip2 += __shfl_down_sync(0xFFFFFFFF, ip2, offset);
+            for (int offset = raft::WarpSize / 2; offset > 0; offset /= 2) {
+              ip2 += __shfl_down_sync(0xFFFFFFFF, ip2, offset);
+            }
+            if (lane_id == 0) { shared_ip2_results[cand_idx] = ip2; }
           }
-          if (lane_id == 0) { shared_ip2_results[cand_idx] = ip2; }
+        } else {
+          // ----- Path B: multiple warps per candidate -----
+          // Layout: warps 0..(warps_per_cand-1) handle cand 0;
+          //         warps warps_per_cand..(2*warps_per_cand-1) handle cand 1; etc.
+          // Cross-warp partial sums go through s_ip2_partial[my_cand*warps_per_cand + my_subwarp].
+          // Sized to 64 — covers num_warps up to 64 (max blockDim 2048 here is bounded
+          // well below that).
+          __shared__ float s_ip2_partial[64];
+          const int warps_per_cand =
+            num_warps / max(1, static_cast<int>(num_candidates));
+          const int my_cand    = warp_id / max(1, warps_per_cand);
+          const int my_subwarp = warp_id % max(1, warps_per_cand);
+
+          if (my_cand < static_cast<int>(num_candidates)) {
+            size_t global_vec_idx = cluster_start_index + shared_candidate_indices[my_cand];
+            const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
+            const int dim_per_subwarp =
+              static_cast<int>((params.D + warps_per_cand - 1) / warps_per_cand);
+            const int dim_start = my_subwarp * dim_per_subwarp;
+            const int dim_end =
+              static_cast<int>(min(static_cast<uint32_t>(params.D),
+                                   static_cast<uint32_t>(dim_start + dim_per_subwarp)));
+
+            float partial = 0.0f;
+            for (int d = dim_start + lane_id; d < dim_end; d += raft::WarpSize) {
+              uint32_t code_val = extract_code(vec_long_code, d, params.ex_bits);
+              partial += shared_query[d] * (float)code_val;
+            }
+#pragma unroll
+            for (int off = raft::WarpSize / 2; off > 0; off /= 2) {
+              partial += __shfl_down_sync(0xFFFFFFFF, partial, off);
+            }
+            if (lane_id == 0) {
+              s_ip2_partial[my_cand * warps_per_cand + my_subwarp] = partial;
+            }
+          }
+          __syncthreads();
+          // Cross-warp reduce per cand: lane 0 of warp `cand` sums up warps_per_cand floats.
+          if (warp_id < static_cast<int>(num_candidates) && lane_id == 0) {
+            float total = 0.0f;
+#pragma unroll 8
+            for (int i = 0; i < warps_per_cand; ++i) {
+              total += s_ip2_partial[warp_id * warps_per_cand + i];
+            }
+            shared_ip2_results[warp_id] = total;
+          }
         }
         __syncthreads();
 
@@ -770,7 +888,8 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   threshold_strategy strategy,
   float centroid_reorder_scale,
   const int* d_raft_idx,
-  bool enable_dynamic_block)
+  bool enable_dynamic_block,
+  ip_variant_kind ip_variant)
 {
   // check if the inner products kernel should use block sort to keep a top-k priority queue vs.
   // outputting distances from all vectors in probed clusters
@@ -995,6 +1114,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   kernelParams.d_query_write_counters = d_query_write_counters.data_handle();
   kernelParams.num_bits               = num_bits;
   kernelParams.num_words              = num_words;
+  kernelParams.ip_variant             = static_cast<uint8_t>(ip_variant);
 
   if (!use_4bit) {
     if (cur_ivf.get_ex_bits() != 0) {

@@ -337,19 +337,71 @@ __global__ void computeInnerProductsWithLUT16OptBlockSort(
         const int lane_id         = tid % raft::WarpSize;
         const int num_warps       = num_threads / raft::WarpSize;
 
-        for (int cand_idx = warp_id; cand_idx < num_candidates; cand_idx += num_warps) {
-          size_t global_vec_idx        = cluster_start_index + shared_candidate_indices[cand_idx];
-          const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
-          float ip2                    = 0.0f;
-          for (uint32_t d = lane_id; d < params.D; d += raft::WarpSize) {
-            uint32_t code_val = extract_code(vec_long_code, d, params.ex_bits);
-            ip2 += shared_query[d] * (float)code_val;
-          }
+        // Hybrid granularity for IP2 (lut16 has no Phase 2 — the LUT already
+        // computed the exact 1-bit IP). See quant4 kernel for path semantics.
+        // Forced `warp_per_cand` falls back to Path A when ncand >= num_warps:
+        // Path B's warps_per_cand = num_warps / ncand integer-divides to 0
+        // there and would skip candidates.
+        bool path_a_ip2;
+        if (params.ip_variant == 1) {
+          path_a_ip2 = true;
+        } else {
+          path_a_ip2 = static_cast<int>(num_candidates) >= num_warps;
+        }
+        if (path_a_ip2) {
+          for (int cand_idx = warp_id; cand_idx < num_candidates; cand_idx += num_warps) {
+            size_t global_vec_idx = cluster_start_index + shared_candidate_indices[cand_idx];
+            const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
+            float ip2                    = 0.0f;
+            for (uint32_t d = lane_id; d < params.D; d += raft::WarpSize) {
+              uint32_t code_val = extract_code(vec_long_code, d, params.ex_bits);
+              ip2 += shared_query[d] * (float)code_val;
+            }
 #pragma unroll
-          for (int offset = raft::WarpSize / 2; offset > 0; offset /= 2) {
-            ip2 += __shfl_down_sync(0xFFFFFFFF, ip2, offset);
+            for (int offset = raft::WarpSize / 2; offset > 0; offset /= 2) {
+              ip2 += __shfl_down_sync(0xFFFFFFFF, ip2, offset);
+            }
+            if (lane_id == 0) { shared_ip2_results[cand_idx] = ip2; }
           }
-          if (lane_id == 0) { shared_ip2_results[cand_idx] = ip2; }
+        } else {
+          // ----- Path B: multiple warps per candidate -----
+          __shared__ float s_ip2_partial[64];
+          const int warps_per_cand =
+            num_warps / max(1, static_cast<int>(num_candidates));
+          const int my_cand    = warp_id / max(1, warps_per_cand);
+          const int my_subwarp = warp_id % max(1, warps_per_cand);
+
+          if (my_cand < static_cast<int>(num_candidates)) {
+            size_t global_vec_idx = cluster_start_index + shared_candidate_indices[my_cand];
+            const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
+            const int dim_per_subwarp =
+              static_cast<int>((params.D + warps_per_cand - 1) / warps_per_cand);
+            const int dim_start = my_subwarp * dim_per_subwarp;
+            const int dim_end =
+              static_cast<int>(min(static_cast<uint32_t>(params.D),
+                                   static_cast<uint32_t>(dim_start + dim_per_subwarp)));
+            float partial = 0.0f;
+            for (int d = dim_start + lane_id; d < dim_end; d += raft::WarpSize) {
+              uint32_t code_val = extract_code(vec_long_code, d, params.ex_bits);
+              partial += shared_query[d] * (float)code_val;
+            }
+#pragma unroll
+            for (int off = raft::WarpSize / 2; off > 0; off /= 2) {
+              partial += __shfl_down_sync(0xFFFFFFFF, partial, off);
+            }
+            if (lane_id == 0) {
+              s_ip2_partial[my_cand * warps_per_cand + my_subwarp] = partial;
+            }
+          }
+          __syncthreads();
+          if (warp_id < static_cast<int>(num_candidates) && lane_id == 0) {
+            float total = 0.0f;
+#pragma unroll 8
+            for (int i = 0; i < warps_per_cand; ++i) {
+              total += s_ip2_partial[warp_id * warps_per_cand + i];
+            }
+            shared_ip2_results[warp_id] = total;
+          }
         }
         __syncthreads();
 
@@ -556,7 +608,8 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
                                                       threshold_strategy strategy,
                                                       float centroid_reorder_scale,
                                                       const int* d_raft_idx,
-                                                      bool enable_dynamic_block)
+                                                      bool enable_dynamic_block,
+                                                      ip_variant_kind ip_variant)
 {
   // Using BF16 for storage
 
@@ -686,6 +739,7 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
   kernelParams.num_pairs               = num_pairs;
   kernelParams.num_centroids           = cur_ivf.get_num_centroids();
   kernelParams.D                       = D;
+  kernelParams.ip_variant              = static_cast<uint8_t>(ip_variant);
   kernelParams.d_threshold             = d_topk_threshold_batch.data();
   kernelParams.max_candidates_per_pair = max_cluster_size;
   kernelParams.max_candidates_per_query =

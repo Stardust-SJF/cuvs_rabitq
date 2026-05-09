@@ -254,6 +254,19 @@ void parse_search_param(const nlohmann::json& conf,
   if (conf.contains("skip_sort_threshold")) {
     param.rabitq_param.skip_sort_threshold = conf.at("skip_sort_threshold");
   }
+  if (conf.contains("ip_variant")) {
+    std::string variant = conf.at("ip_variant");
+    if (variant == "auto") {
+      param.rabitq_param.ip_variant = cuvs::neighbors::ivf_rabitq::ip_variant_kind::auto_;
+    } else if (variant == "thread_per_cand") {
+      param.rabitq_param.ip_variant = cuvs::neighbors::ivf_rabitq::ip_variant_kind::thread_per_cand;
+    } else if (variant == "warp_per_cand") {
+      param.rabitq_param.ip_variant = cuvs::neighbors::ivf_rabitq::ip_variant_kind::warp_per_cand;
+    } else {
+      throw std::runtime_error(
+        "ip_variant: '" + variant + "', should be 'auto', 'thread_per_cand', or 'warp_per_cand'");
+    }
+  }
 }
 #endif
 
