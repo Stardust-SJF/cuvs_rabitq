@@ -232,6 +232,22 @@ void parse_search_param(const nlohmann::json& conf,
                                "', should be either 'lut16', 'lut32', 'quant4' or 'quant8'");
     }
   }
+
+  if (conf.contains("strategy")) {
+    std::string strategy = conf.at("strategy");
+    if (strategy == "none") {
+      param.rabitq_param.strategy = cuvs::neighbors::ivf_rabitq::threshold_strategy::none;
+    } else if (strategy == "centroid_reorder") {
+      param.rabitq_param.strategy =
+        cuvs::neighbors::ivf_rabitq::threshold_strategy::centroid_reorder;
+    } else {
+      throw std::runtime_error("strategy: '" + strategy +
+                               "', should be 'none' or 'centroid_reorder'");
+    }
+  }
+  if (conf.contains("centroid_reorder_scale")) {
+    param.rabitq_param.centroid_reorder_scale = conf.at("centroid_reorder_scale");
+  }
 }
 #endif
 

@@ -73,5 +73,33 @@ __device__ inline uint32_t extract_code(const uint8_t* codes, size_t d, size_t E
   return (v >> shift) & ((1u << EX_BITS) - 1);
 }
 
+// Threshold-seeding kernel for the CENTROID_REORDER strategy.
+//
+// For each query, picks the topk-th nearest cluster (rank = topk-1, clamped to
+// nprobe-1) from raft::matrix::select_k's query-major output and seeds the
+// per-query topk threshold to scale * dist(query, that cluster). The first
+// cluster scanned by the main search kernel can then prune candidates whose
+// lower-bound exceeds this seed.
+//
+// IMPORTANT: indexes into d_raft_idx (RAFT select_k output, query-major,
+// distance-ascending) and NOT d_sorted_pairs (cluster-major after the radix
+// sort). With NQ > 1 the cluster-major layout would mix queries together.
+__global__ inline void seed_threshold_from_centroid_kernel(const int* d_raft_idx,
+                                                           const float* d_centroid_distances,
+                                                           float* d_threshold_batch,
+                                                           size_t num_queries,
+                                                           size_t num_centroids,
+                                                           size_t nprobe,
+                                                           size_t topk,
+                                                           float scale)
+{
+  size_t q = blockIdx.x * blockDim.x + threadIdx.x;
+  if (q >= num_queries) return;
+  size_t rank      = (topk > 0 && topk - 1 < nprobe) ? (topk - 1) : (nprobe - 1);
+  int cluster_idx  = d_raft_idx[q * nprobe + rank];
+  float q_g_add    = d_centroid_distances[q * num_centroids + cluster_idx];
+  d_threshold_batch[q] = q_g_add * scale;
+}
+
 }  // namespace
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

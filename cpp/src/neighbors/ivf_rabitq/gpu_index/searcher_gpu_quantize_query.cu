@@ -766,8 +766,10 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   size_t topk,
   float* d_final_dists,
   PID* d_final_pids,
-  bool use_4bit  // Add parameter to choose 4-bit or 8-bit
-)
+  bool use_4bit,                       // Choose 4-bit or 8-bit query quant
+  threshold_strategy strategy,
+  float centroid_reorder_scale,
+  const int* d_raft_idx)
 {
   // check if the inner products kernel should use block sort to keep a top-k priority queue vs.
   // outputting distances from all vectors in probed clusters
@@ -904,10 +906,29 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                0);
 
   if (use_block_sort) {
-    thrust::fill(thrust::cuda::par.on(stream_),
-                 d_topk_threshold_batch.data_handle(),
-                 d_topk_threshold_batch.data_handle() + num_queries,
-                 std::numeric_limits<float>::infinity());
+    if (strategy == threshold_strategy::centroid_reorder && d_raft_idx != nullptr) {
+      // Seed each query's threshold to scale * dist(query, topk-th nearest centroid).
+      // The first cluster scanned by the main kernel can then prune candidates whose
+      // lower-bound exceeds this seed.
+      const int seed_block = 256;
+      const int seed_grid  = (num_queries + seed_block - 1) / seed_block;
+      seed_threshold_from_centroid_kernel<<<seed_grid, seed_block, 0, stream_>>>(
+        d_raft_idx,
+        get_centroid_distances(),
+        d_topk_threshold_batch.data_handle(),
+        num_queries,
+        cur_ivf.get_num_centroids(),
+        nprobe,
+        topk,
+        centroid_reorder_scale);
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+    } else {
+      // strategy == none: fall back to +infinity (admit-all on first cluster).
+      thrust::fill(thrust::cuda::par.on(stream_),
+                   d_topk_threshold_batch.data_handle(),
+                   d_topk_threshold_batch.data_handle() + num_queries,
+                   std::numeric_limits<float>::infinity());
+    }
   }
 
   // Launch modified kernel with packed queries instead of LUT

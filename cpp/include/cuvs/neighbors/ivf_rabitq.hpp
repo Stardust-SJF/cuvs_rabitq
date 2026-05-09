@@ -117,11 +117,37 @@ enum class search_mode {
   QUANT8 = 3,
 };
 
+/**
+ * Threshold-seeding strategy for the in-kernel topk pruning during search.
+ *
+ * The search kernel maintains a per-query running max of the topk distances
+ * found so far; new candidates are admitted only if their lower-bound estimate
+ * is below this threshold. The initial value of that threshold determines how
+ * aggressively the first cluster scanned can prune.
+ */
+enum class threshold_strategy : uint8_t {
+  /** Threshold initialised to +infinity. The first cluster's main kernel
+   *  admits every candidate; pruning only kicks in for subsequent clusters
+   *  after the first cluster's topk has been computed. */
+  none = 0,
+  /** Threshold seeded as `centroid_reorder_scale * (distance from query to
+   *  topk-th nearest centroid)`. The first cluster's main kernel can already
+   *  prune candidates whose lower-bound exceeds this seed, materially cutting
+   *  the candidate set on the first cluster scan. Production default. */
+  centroid_reorder = 1,
+};
+
 struct search_params : cuvs::neighbors::search_params {
   /** The number of clusters to search. */
   uint32_t n_probes = 20;
   /** The search mode to be used. */
   search_mode mode = search_mode::QUANT4;
+  /** Threshold-seeding strategy. See `threshold_strategy`. */
+  threshold_strategy strategy = threshold_strategy::centroid_reorder;
+  /** Scale factor for the CENTROID_REORDER seed threshold. Production default
+   *  is 1.5 (per upstream sweep across multiple datasets). Ignored when
+   *  `strategy == none`. */
+  float centroid_reorder_scale = 1.5f;
 };
 /**
  * @}

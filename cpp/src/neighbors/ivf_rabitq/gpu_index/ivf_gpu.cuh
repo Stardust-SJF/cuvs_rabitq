@@ -290,25 +290,34 @@ class IVFGPU {
                                void* searcher,
                                size_t batch_size,
                                float* d_final_dists,
-                               PID* d_final_pids);
+                               PID* d_final_pids,
+                               threshold_strategy strategy = threshold_strategy::centroid_reorder,
+                               float centroid_reorder_scale = 1.5f);
 
-  void BatchClusterSearchQuantizeQuery(const float* d_query,
-                                       size_t k,
-                                       size_t nprobe,
-                                       void* searcher,
-                                       size_t batch_size,
-                                       float* d_final_dists,
-                                       PID* d_final_pids,
-                                       int query_bits);
+  void BatchClusterSearchQuantizeQuery(
+    const float* d_query,
+    size_t k,
+    size_t nprobe,
+    void* searcher,
+    size_t batch_size,
+    float* d_final_dists,
+    PID* d_final_pids,
+    int query_bits,
+    threshold_strategy strategy   = threshold_strategy::centroid_reorder,
+    float centroid_reorder_scale  = 1.5f);
 
  private:
+  // d_raft_idx_out exposes raft::matrix::select_k's query-major output so that
+  // CENTROID_REORDER threshold seeding can sample the topk-th nearest cluster
+  // per query. Caller passes a device_matrix shaped (batch_size, nprobe).
   void PrepareClusterSearchInputs(const float* d_query,
                                   size_t batch_size,
                                   size_t nprobe,
                                   SearcherGPU* searcher_batch,
                                   raft::device_vector<ClusterQueryPair, int64_t>& d_sorted_pairs,
                                   raft::device_vector<float, int64_t>& d_G_k1xSumq,
-                                  raft::device_vector<float, int64_t>& d_G_kbxSumq);
+                                  raft::device_vector<float, int64_t>& d_G_kbxSumq,
+                                  raft::device_matrix<int, int64_t>& d_raft_idx_out);
 
   /**
    * @brief function to allocate memory based on the cluster

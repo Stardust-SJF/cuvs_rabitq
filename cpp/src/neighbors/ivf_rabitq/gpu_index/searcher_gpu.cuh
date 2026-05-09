@@ -79,30 +79,38 @@ class SearcherGPU {
                                float* d_final_dists,
                                PID* d_final_pids);
 
-  void SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
-                                           IVFGPU::GPUClusterMeta* d_cluster_meta,
-                                           ClusterQueryPair* d_sorted_pairs,
-                                           size_t num_queries,
-                                           const float* d_query,
-                                           const float* d_G_k1xSumq,
-                                           const float* d_G_kbxSumq,
-                                           size_t nprobe,
-                                           size_t topk,
-                                           float* d_final_dists,
-                                           PID* d_final_pids);
+  void SearchClusterQueryPairsSharedMemOpt(
+    const IVFGPU& cur_ivf,
+    IVFGPU::GPUClusterMeta* d_cluster_meta,
+    ClusterQueryPair* d_sorted_pairs,
+    size_t num_queries,
+    const float* d_query,
+    const float* d_G_k1xSumq,
+    const float* d_G_kbxSumq,
+    size_t nprobe,
+    size_t topk,
+    float* d_final_dists,
+    PID* d_final_pids,
+    threshold_strategy strategy   = threshold_strategy::centroid_reorder,
+    float centroid_reorder_scale  = 1.5f,
+    const int* d_raft_idx         = nullptr);
 
-  void SearchClusterQueryPairsQuantizeQuery(const IVFGPU& cur_ivf,
-                                            IVFGPU::GPUClusterMeta* d_cluster_meta,
-                                            ClusterQueryPair* d_sorted_pairs,
-                                            size_t num_queries,
-                                            const float* d_query,
-                                            const float* d_G_k1xSumq,
-                                            const float* d_G_kbxSumq,
-                                            size_t nprobe,
-                                            size_t topk,
-                                            float* d_final_dists,
-                                            PID* d_final_pids,
-                                            bool use_4bit = false);
+  void SearchClusterQueryPairsQuantizeQuery(
+    const IVFGPU& cur_ivf,
+    IVFGPU::GPUClusterMeta* d_cluster_meta,
+    ClusterQueryPair* d_sorted_pairs,
+    size_t num_queries,
+    const float* d_query,
+    const float* d_G_k1xSumq,
+    const float* d_G_kbxSumq,
+    size_t nprobe,
+    size_t topk,
+    float* d_final_dists,
+    PID* d_final_pids,
+    bool use_4bit                 = false,
+    threshold_strategy strategy   = threshold_strategy::centroid_reorder,
+    float centroid_reorder_scale  = 1.5f,
+    const int* d_raft_idx         = nullptr);
 
  private:
   raft::resources const& handle_;  // reusable resource handle

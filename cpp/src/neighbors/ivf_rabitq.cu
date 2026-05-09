@@ -251,7 +251,9 @@ void search(raft::resources const& handle,
                                                &searcher,
                                                NQ,
                                                distances.data_handle(),
-                                               final_ids.data_handle());
+                                               final_ids.data_handle(),
+                                               params.strategy,
+                                               params.centroid_reorder_scale);
   } else if (params.mode == search_mode::QUANT8) {
     idx.rabitq_index().BatchClusterSearchQuantizeQuery(rotated_queries.data_handle(),
                                                        k,
@@ -260,7 +262,9 @@ void search(raft::resources const& handle,
                                                        NQ,
                                                        distances.data_handle(),
                                                        final_ids.data_handle(),
-                                                       8);
+                                                       8,
+                                                       params.strategy,
+                                                       params.centroid_reorder_scale);
   } else if (params.mode == search_mode::QUANT4) {
     idx.rabitq_index().BatchClusterSearchQuantizeQuery(rotated_queries.data_handle(),
                                                        k,
@@ -269,7 +273,9 @@ void search(raft::resources const& handle,
                                                        NQ,
                                                        distances.data_handle(),
                                                        final_ids.data_handle(),
-                                                       4);
+                                                       4,
+                                                       params.strategy,
+                                                       params.centroid_reorder_scale);
   }
 
   // cast data in d_final_ids to array of IdxT in neighbors
