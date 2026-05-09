@@ -9,6 +9,7 @@
 
 #include "ivf_gpu.cuh"
 #include "searcher_gpu.cuh"
+#include "searcher_gpu_common.cuh"  // build_query_major_pairs_kernel + compute_dynamic_block_dim
 #include <raft/util/integer_utils.hpp>
 
 #include <raft/core/cublas_macros.hpp>
@@ -1226,7 +1227,8 @@ void IVFGPU::PrepareClusterSearchInputs(
   raft::device_vector<ClusterQueryPair, int64_t>& d_sorted_pairs,
   raft::device_vector<float, int64_t>& d_G_k1xSumq,
   raft::device_vector<float, int64_t>& d_G_kbxSumq,
-  raft::device_matrix<int, int64_t>& d_raft_idx_out)
+  raft::device_matrix<int, int64_t>& d_raft_idx_out,
+  uint32_t skip_sort_threshold)
 {
   // Step 1: Compute -2 * Q * C^T using RAFT wrapper for cuBLASLt
   const float alpha = -2.f, beta = 0.f;
@@ -1286,11 +1288,35 @@ void IVFGPU::PrepareClusterSearchInputs(
                                      /*sorted=*/true,
                                      raft::matrix::SelectAlgo::kAuto);
 
-  // Step 5: sort (cluster, query) pairs
+  // Step 5: build (cluster, query) pairs.
+  //
+  // Cluster-major sort (the default) groups all blocks scanning the same
+  // cluster together, which gives L2 reuse on the per-cluster bulk reads. At
+  // small batch / small nprobe coresidency = ceil(batch_size * nprobe /
+  // num_centroids) is so low that the sort can't amortise its own cost over
+  // the reuse it would create — we then build pairs query-major directly
+  // from raft::matrix::select_k's output.
   d_sorted_pairs =
     raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, batch_size * nprobe);
-  sort_cluster_query_pairs(
-    handle_, d_raft_idx_out.data_handle(), d_sorted_pairs.data_handle(), batch_size, nprobe);
+  bool skip_sort = false;
+  if (skip_sort_threshold > 0) {
+    size_t coresidency = (batch_size * nprobe + num_centroids - 1) / num_centroids;
+    if (coresidency < skip_sort_threshold) { skip_sort = true; }
+  }
+  if (skip_sort) {
+    int total_pairs   = static_cast<int>(batch_size * nprobe);
+    const int threads = 256;
+    const int blocks  = (total_pairs + threads - 1) / threads;
+    build_query_major_pairs_kernel<<<blocks, threads, 0, stream_>>>(
+      d_raft_idx_out.data_handle(),
+      d_sorted_pairs.data_handle(),
+      static_cast<int>(batch_size),
+      static_cast<int>(nprobe));
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
+  } else {
+    sort_cluster_query_pairs(
+      handle_, d_raft_idx_out.data_handle(), d_sorted_pairs.data_handle(), batch_size, nprobe);
+  }
 
   // Step 6: compute query factors
   d_G_k1xSumq = raft::make_device_vector<float, int64_t>(handle_, batch_size);
@@ -1348,7 +1374,9 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                      float* d_final_dists,
                                      PID* d_final_pids,
                                      threshold_strategy strategy,
-                                     float centroid_reorder_scale)
+                                     float centroid_reorder_scale,
+                                     bool enable_dynamic_block,
+                                     uint32_t skip_sort_threshold)
 {
   SearcherGPU* searcher_batch = (SearcherGPU*)searcher;
   auto d_sorted_pairs         = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
@@ -1362,7 +1390,8 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                              d_sorted_pairs,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
-                             d_raft_idx);
+                             d_raft_idx,
+                             skip_sort_threshold);
   searcher_batch->SearchClusterQueryPairsSharedMemOpt(*this,
                                                       cluster_meta_.data_handle(),
                                                       d_sorted_pairs.data_handle(),
@@ -1376,7 +1405,8 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                                       d_final_pids,
                                                       strategy,
                                                       centroid_reorder_scale,
-                                                      d_raft_idx.data_handle());
+                                                      d_raft_idx.data_handle(),
+                                                      enable_dynamic_block);
 }
 
 void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
@@ -1388,7 +1418,9 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                              PID* d_final_pids,
                                              int query_bits,
                                              threshold_strategy strategy,
-                                             float centroid_reorder_scale)
+                                             float centroid_reorder_scale,
+                                             bool enable_dynamic_block,
+                                             uint32_t skip_sort_threshold)
 {
   SearcherGPU* searcher_batch = (SearcherGPU*)searcher;
   auto d_sorted_pairs         = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
@@ -1402,7 +1434,8 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                              d_sorted_pairs,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
-                             d_raft_idx);
+                             d_raft_idx,
+                             skip_sort_threshold);
   searcher_batch->SearchClusterQueryPairsQuantizeQuery(*this,
                                                        cluster_meta_.data_handle(),
                                                        d_sorted_pairs.data_handle(),
@@ -1417,7 +1450,8 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                                        query_bits == 4,
                                                        strategy,
                                                        centroid_reorder_scale,
-                                                       d_raft_idx.data_handle());
+                                                       d_raft_idx.data_handle(),
+                                                       enable_dynamic_block);
 }
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

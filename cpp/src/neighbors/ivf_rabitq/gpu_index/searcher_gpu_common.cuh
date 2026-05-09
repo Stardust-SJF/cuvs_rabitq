@@ -73,6 +73,77 @@ __device__ inline uint32_t extract_code(const uint8_t* codes, size_t d, size_t E
   return (v >> shift) & ((1u << EX_BITS) - 1);
 }
 
+// Build d_sorted_pairs query-major directly from raft::matrix::select_k's
+// output, skipping the cluster-major radix sort. Used when coresidency
+// (avg pairs per cluster) is too low to amortise the sort over L2 reuse.
+__global__ inline void build_query_major_pairs_kernel(const int* d_raft_idx,
+                                                      ClusterQueryPair* d_sorted_pairs,
+                                                      int batch_size,
+                                                      int nprobe)
+{
+  int tid         = blockIdx.x * blockDim.x + threadIdx.x;
+  int total_pairs = batch_size * nprobe;
+  if (tid < total_pairs) {
+    d_sorted_pairs[tid].cluster_idx = d_raft_idx[tid];
+    d_sorted_pairs[tid].query_idx   = tid / nprobe;
+  }
+}
+
+// Floor below which the search kernel's tuned shared-memory layout, MAX_TOP_K
+// warpsort, and candidate-scan grid-stride loop assumptions degrade.
+// Empirically (GBitQ bench_dynblock_coresidency.csv) shrinking below 256 caused
+// 30-70% QPS regressions at NQ >= 100.
+static constexpr uint32_t kSearchKernelMinBlockDim = 256;
+
+// Choose a search-kernel blockDim based on device occupancy and total work.
+// Reproduces cuvs's IVF-PQ compute_similarity heuristic with three nested
+// while-loops plus a Loop D bump for small nprobe + plentiful total work.
+//
+// Loop A: ensure max-occupancy blocks could fill an SM threadwise.
+// Loop B: ensure total threads (num_pairs * n_threads) cover the whole device.
+// Loop C: at small num_queries, fill one SM with one query's threads (better
+//         L1 hit rate for that query's per-cluster bulk reads).
+// Loop D: at small nprobe (<=10) and Loops A/B/C settled at the floor, bump
+//         to 512 to give the ex-code re-rank stage more warp-per-candidate
+//         parallelism.
+//
+// Returns a power of two in [kSearchKernelMinBlockDim, kernel_max_threads_per_block].
+static inline uint32_t compute_dynamic_block_dim(size_t num_queries,
+                                                 size_t num_pairs,
+                                                 const cudaDeviceProp& dev_props,
+                                                 int kernel_max_threads_per_block)
+{
+  const uint32_t cap = (kernel_max_threads_per_block > 0)
+                         ? static_cast<uint32_t>(kernel_max_threads_per_block)
+                         : static_cast<uint32_t>(dev_props.maxThreadsPerBlock);
+  uint32_t n_threads = static_cast<uint32_t>(raft::WarpSize);
+  // Loop A
+  while (static_cast<size_t>(dev_props.maxBlocksPerMultiProcessor) * n_threads <
+           static_cast<size_t>(dev_props.maxThreadsPerMultiProcessor) &&
+         n_threads < cap) {
+    n_threads *= 2;
+  }
+  // Loop B
+  while (num_pairs * n_threads < static_cast<size_t>(dev_props.multiProcessorCount) *
+                                   dev_props.maxThreadsPerMultiProcessor &&
+         n_threads < cap) {
+    n_threads *= 2;
+  }
+  // Loop C
+  while (num_queries * n_threads <
+           static_cast<size_t>(dev_props.maxThreadsPerMultiProcessor) &&
+         n_threads < cap) {
+    n_threads *= 2;
+  }
+  // Loop D
+  const size_t nprobe = (num_queries > 0) ? (num_pairs / num_queries) : 0;
+  if (nprobe <= 10 && n_threads < 512u && cap >= 512u) { n_threads = 512u; }
+  if (n_threads > cap) n_threads = cap;
+  if (n_threads < kSearchKernelMinBlockDim) n_threads = kSearchKernelMinBlockDim;
+  if (n_threads > cap) n_threads = cap;  // floor may exceed cap on a tiny kernel
+  return n_threads;
+}
+
 // Threshold-seeding kernel for the CENTROID_REORDER strategy.
 //
 // For each query, picks the topk-th nearest cluster (rank = topk-1, clamped to

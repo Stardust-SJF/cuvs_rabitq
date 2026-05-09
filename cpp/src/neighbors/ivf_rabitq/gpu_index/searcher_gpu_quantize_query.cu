@@ -769,7 +769,8 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   bool use_4bit,                       // Choose 4-bit or 8-bit query quant
   threshold_strategy strategy,
   float centroid_reorder_scale,
-  const int* d_raft_idx)
+  const int* d_raft_idx,
+  bool enable_dynamic_block)
 {
   // check if the inner products kernel should use block sort to keep a top-k priority queue vs.
   // outputting distances from all vectors in probed clusters
@@ -935,6 +936,19 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   size_t num_pairs = num_queries * nprobe;
   uint32_t gridDim{static_cast<uint32_t>(num_pairs)};
   uint32_t blockDim{256};
+  if (enable_dynamic_block) {
+    cudaDeviceProp dev_props{};
+    int dev_id = 0;
+    RAFT_CUDA_TRY(cudaGetDevice(&dev_id));
+    RAFT_CUDA_TRY(cudaGetDeviceProperties(&dev_props, dev_id));
+    // Use a representative kernel for the maxThreadsPerBlock attribute. The
+    // four BitwiseBlockSort variants (NumBits ∈ {4,8} × WithEx ∈ {0,1}) all
+    // share the same launch bounds, so any of them gives a valid cap.
+    cudaFuncAttributes kattrs{};
+    RAFT_CUDA_TRY(cudaFuncGetAttributes(
+      &kattrs, reinterpret_cast<const void*>(&computeInnerProductsWithBitwiseBlockSort<4, true>)));
+    blockDim = compute_dynamic_block_dim(num_queries, num_pairs, dev_props, kattrs.maxThreadsPerBlock);
+  }
 
   // Recalculate shared memory for new approach
   size_t query_storage = D * sizeof(float);  // For shared query vector

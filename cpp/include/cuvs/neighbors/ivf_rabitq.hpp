@@ -148,6 +148,18 @@ struct search_params : cuvs::neighbors::search_params {
    *  is 1.5 (per upstream sweep across multiple datasets). Ignored when
    *  `strategy == none`. */
   float centroid_reorder_scale = 1.5f;
+  /** When true, the search kernel's blockDim is chosen at runtime based on
+   *  device occupancy and total work (3 nested loops: max-blocks-per-SM,
+   *  total-threads-cover-device, single-query-fills-SM, plus a Loop D bump
+   *  to 512 at small nprobe). Floored at 256, capped at the kernel's
+   *  maxThreadsPerBlock. When false, blockDim is the tuned default (256). */
+  bool enable_dynamic_block = true;
+  /** Coresidency-conditional sort skip. When `(num_queries * n_probes) /
+   *  n_lists < skip_sort_threshold`, the cluster-major sort of (cluster,
+   *  query) pairs is replaced by a single fused kernel that emits pairs in
+   *  query-major order. Empirically helps at small batch / small nprobe
+   *  where the sort can't amortise over L2 reuse. Set to 0 to never skip. */
+  uint32_t skip_sort_threshold = 8;
 };
 /**
  * @}

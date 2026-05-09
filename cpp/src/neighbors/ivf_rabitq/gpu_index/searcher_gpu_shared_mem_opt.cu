@@ -555,7 +555,8 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
                                                       PID* d_final_pids,
                                                       threshold_strategy strategy,
                                                       float centroid_reorder_scale,
-                                                      const int* d_raft_idx)
+                                                      const int* d_raft_idx,
+                                                      bool enable_dynamic_block)
 {
   // Using BF16 for storage
 
@@ -652,6 +653,19 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
   size_t num_pairs = num_queries * nprobe;
   uint32_t gridDim{static_cast<uint32_t>(num_pairs)};
   uint32_t blockDim{256};
+  if (enable_dynamic_block) {
+    cudaDeviceProp dev_props{};
+    int dev_id = 0;
+    RAFT_CUDA_TRY(cudaGetDevice(&dev_id));
+    RAFT_CUDA_TRY(cudaGetDeviceProperties(&dev_props, dev_id));
+    // The lut16 main kernel variants share the same launch bounds; pick the
+    // WithEx specialisation as a representative for the maxThreadsPerBlock cap.
+    cudaFuncAttributes kattrs{};
+    RAFT_CUDA_TRY(cudaFuncGetAttributes(
+      &kattrs, reinterpret_cast<const void*>(&computeInnerProductsWithLUT16OptBlockSort<true>)));
+    blockDim =
+      compute_dynamic_block_dim(num_queries, num_pairs, dev_props, kattrs.maxThreadsPerBlock);
+  }
   const int queue_buffer_smem_bytes =
     use_block_sort ? raft::matrix::detail::select::warpsort::calc_smem_size_for_block_wide<T, IdxT>(
                        blockDim / raft::WarpSize, kMaxTopKBlockSort)

@@ -248,6 +248,12 @@ void parse_search_param(const nlohmann::json& conf,
   if (conf.contains("centroid_reorder_scale")) {
     param.rabitq_param.centroid_reorder_scale = conf.at("centroid_reorder_scale");
   }
+  if (conf.contains("enable_dynamic_block")) {
+    param.rabitq_param.enable_dynamic_block = conf.at("enable_dynamic_block");
+  }
+  if (conf.contains("skip_sort_threshold")) {
+    param.rabitq_param.skip_sort_threshold = conf.at("skip_sort_threshold");
+  }
 }
 #endif
 
