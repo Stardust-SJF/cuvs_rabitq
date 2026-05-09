@@ -267,6 +267,23 @@ void parse_search_param(const nlohmann::json& conf,
         "ip_variant: '" + variant + "', should be 'auto', 'thread_per_cand', or 'warp_per_cand'");
     }
   }
+  if (conf.contains("centroid_select")) {
+    std::string sel = conf.at("centroid_select");
+    if (sel == "auto_policy") {
+      param.rabitq_param.centroid_select =
+        cuvs::neighbors::ivf_rabitq::centroid_select_kind::auto_policy;
+    } else if (sel == "kauto") {
+      param.rabitq_param.centroid_select =
+        cuvs::neighbors::ivf_rabitq::centroid_select_kind::kauto;
+    } else if (sel == "warp_distributed_shm") {
+      param.rabitq_param.centroid_select =
+        cuvs::neighbors::ivf_rabitq::centroid_select_kind::warp_distributed_shm;
+    } else {
+      throw std::runtime_error(
+        "centroid_select: '" + sel +
+        "', should be 'auto_policy', 'kauto', or 'warp_distributed_shm'");
+    }
+  }
 }
 #endif
 

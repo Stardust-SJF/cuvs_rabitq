@@ -155,6 +155,31 @@ enum class threshold_strategy : uint8_t {
   centroid_reorder = 1,
 };
 
+/**
+ * Algorithm used by the centroid-distance top-K (`raft::matrix::select_k`
+ * call that picks the `n_probes` nearest clusters per query).
+ *
+ * `raft::matrix::select_k`'s `kAuto` heuristic at our typical shape
+ * (n_queries small, n_lists ≈ 4096, k = n_probes) doesn't include
+ * `kWarpDistributedShm` in its selection space — it picks `kWarpImmediate`
+ * instead. An end-to-end sweep at small batch showed `kWarpDistributedShm`
+ * leaves a small (+0.7–2.8% kQPS) but consistent win on the table at
+ * NQ ∈ {1, 10}, with parity at NQ ≥ 100. Recall is bit-identical across
+ * all warp/radix variants.
+ *
+ * raft's warpsort family has a hard `k <= 256` limit; the production
+ * default `auto_policy` therefore falls back to `kauto` when n_probes > 256.
+ */
+enum class centroid_select_kind : uint8_t {
+  /** kWarpDistributedShm when n_probes ≤ 256, else kAuto. Production default. */
+  auto_policy = 0,
+  /** Always use raft::matrix::SelectAlgo::kAuto (pre-step-7 behavior). */
+  kauto = 1,
+  /** Always use raft::matrix::SelectAlgo::kWarpDistributedShm. Errors at
+   *  runtime if n_probes > 256 (raft warpsort's kMaxCapacity). For ablation. */
+  warp_distributed_shm = 2,
+};
+
 struct search_params : cuvs::neighbors::search_params {
   /** The number of clusters to search. */
   uint32_t n_probes = 20;
@@ -181,6 +206,10 @@ struct search_params : cuvs::neighbors::search_params {
   /** See `ip_variant_kind`. Default `auto_` runs the per-block hybrid
    *  dispatch; the other values force one path for ablation. */
   ip_variant_kind ip_variant = ip_variant_kind::auto_;
+  /** See `centroid_select_kind`. Default `auto_policy` picks the best
+   *  raft::matrix::SelectAlgo for our shape (kWarpDistributedShm at small k,
+   *  kAuto fallback at k > 256). */
+  centroid_select_kind centroid_select = centroid_select_kind::auto_policy;
 };
 /**
  * @}

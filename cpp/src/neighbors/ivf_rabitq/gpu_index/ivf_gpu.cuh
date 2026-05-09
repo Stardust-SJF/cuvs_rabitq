@@ -284,18 +284,20 @@ class IVFGPU {
                           float* d_final_dists,
                           PID* d_final_pids);
 
-  void BatchClusterSearchLUT16(const float* d_query,
-                               size_t k,
-                               size_t nprobe,
-                               void* searcher,
-                               size_t batch_size,
-                               float* d_final_dists,
-                               PID* d_final_pids,
-                               threshold_strategy strategy = threshold_strategy::centroid_reorder,
-                               float centroid_reorder_scale = 1.5f,
-                               bool enable_dynamic_block    = true,
-                               uint32_t skip_sort_threshold = 8,
-                               ip_variant_kind ip_variant   = ip_variant_kind::auto_);
+  void BatchClusterSearchLUT16(
+    const float* d_query,
+    size_t k,
+    size_t nprobe,
+    void* searcher,
+    size_t batch_size,
+    float* d_final_dists,
+    PID* d_final_pids,
+    threshold_strategy strategy        = threshold_strategy::centroid_reorder,
+    float centroid_reorder_scale       = 1.5f,
+    bool enable_dynamic_block          = true,
+    uint32_t skip_sort_threshold       = 8,
+    ip_variant_kind ip_variant         = ip_variant_kind::auto_,
+    centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
 
   void BatchClusterSearchQuantizeQuery(
     const float* d_query,
@@ -306,11 +308,12 @@ class IVFGPU {
     float* d_final_dists,
     PID* d_final_pids,
     int query_bits,
-    threshold_strategy strategy   = threshold_strategy::centroid_reorder,
-    float centroid_reorder_scale  = 1.5f,
-    bool enable_dynamic_block     = true,
-    uint32_t skip_sort_threshold  = 8,
-    ip_variant_kind ip_variant    = ip_variant_kind::auto_);
+    threshold_strategy strategy        = threshold_strategy::centroid_reorder,
+    float centroid_reorder_scale       = 1.5f,
+    bool enable_dynamic_block          = true,
+    uint32_t skip_sort_threshold       = 8,
+    ip_variant_kind ip_variant         = ip_variant_kind::auto_,
+    centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
 
  private:
   // d_raft_idx_out exposes raft::matrix::select_k's query-major output so that
@@ -318,15 +321,17 @@ class IVFGPU {
   // per query. Caller passes a device_matrix shaped (batch_size, nprobe).
   // skip_sort_threshold > 0: when (batch_size * nprobe) / num_centroids is
   // below this, build d_sorted_pairs query-major instead of cluster-major.
-  void PrepareClusterSearchInputs(const float* d_query,
-                                  size_t batch_size,
-                                  size_t nprobe,
-                                  SearcherGPU* searcher_batch,
-                                  raft::device_vector<ClusterQueryPair, int64_t>& d_sorted_pairs,
-                                  raft::device_vector<float, int64_t>& d_G_k1xSumq,
-                                  raft::device_vector<float, int64_t>& d_G_kbxSumq,
-                                  raft::device_matrix<int, int64_t>& d_raft_idx_out,
-                                  uint32_t skip_sort_threshold = 0);
+  void PrepareClusterSearchInputs(
+    const float* d_query,
+    size_t batch_size,
+    size_t nprobe,
+    SearcherGPU* searcher_batch,
+    raft::device_vector<ClusterQueryPair, int64_t>& d_sorted_pairs,
+    raft::device_vector<float, int64_t>& d_G_k1xSumq,
+    raft::device_vector<float, int64_t>& d_G_kbxSumq,
+    raft::device_matrix<int, int64_t>& d_raft_idx_out,
+    uint32_t skip_sort_threshold      = 0,
+    centroid_select_kind centroid_sel = centroid_select_kind::auto_policy);
 
   /**
    * @brief function to allocate memory based on the cluster
