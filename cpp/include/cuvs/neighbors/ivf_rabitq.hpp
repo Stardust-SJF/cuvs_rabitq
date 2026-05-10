@@ -159,25 +159,24 @@ enum class threshold_strategy : uint8_t {
  * Algorithm used by the centroid-distance top-K (`raft::matrix::select_k`
  * call that picks the `n_probes` nearest clusters per query).
  *
- * `raft::matrix::select_k`'s `kAuto` heuristic at our typical shape
- * (n_queries small, n_lists ≈ 4096, k = n_probes) doesn't include
- * `kWarpDistributedShm` in its selection space — it picks `kWarpImmediate`
- * instead. An end-to-end sweep at small batch showed `kWarpDistributedShm`
- * leaves a small (+0.7–2.8% kQPS) but consistent win on the table at
- * NQ ∈ {1, 10}, with parity at NQ ≥ 100. Recall is bit-identical across
- * all warp/radix variants.
+ * Production default `auto_policy` defers to raft's `kAuto` heuristic. A
+ * diagnostic sweep across {kauto, warp_distributed_shm, radix11bits} on
+ * wiki_all (n_lists=40000, batch=1000) showed all three within ±2% kQPS at
+ * every `n_probes ∈ [64, 400]`. The choice is essentially neutral at our
+ * shape, so we let raft pick.
  *
- * raft's warpsort family has a hard `k <= 256` limit; the production
- * default `auto_policy` therefore falls back to `kauto` when n_probes > 256.
+ * The forced-algorithm values are retained for ablation only.
  */
 enum class centroid_select_kind : uint8_t {
-  /** kWarpDistributedShm when n_probes ≤ 256, else kAuto. Production default. */
+  /** Defer to `raft::matrix::SelectAlgo::kAuto`. Production default. */
   auto_policy = 0,
-  /** Always use raft::matrix::SelectAlgo::kAuto (pre-step-7 behavior). */
+  /** Alias for `auto_policy`; both pass raft's `kAuto`. */
   kauto = 1,
-  /** Always use raft::matrix::SelectAlgo::kWarpDistributedShm. Errors at
-   *  runtime if n_probes > 256 (raft warpsort's kMaxCapacity). For ablation. */
+  /** Always use `raft::matrix::SelectAlgo::kWarpDistributedShm`. Errors at
+   *  runtime if `n_probes > 256` (raft warpsort's kMaxCapacity). Ablation. */
   warp_distributed_shm = 2,
+  /** Always use `raft::matrix::SelectAlgo::kRadix11bits`. Ablation. */
+  radix11bits = 3,
 };
 
 struct search_params : cuvs::neighbors::search_params {
@@ -200,15 +199,29 @@ struct search_params : cuvs::neighbors::search_params {
   /** Coresidency-conditional sort skip. When `(num_queries * n_probes) /
    *  n_lists < skip_sort_threshold`, the cluster-major sort of (cluster,
    *  query) pairs is replaced by a single fused kernel that emits pairs in
-   *  query-major order. Empirically helps at small batch / small nprobe
-   *  where the sort can't amortise over L2 reuse. Set to 0 to never skip. */
-  uint32_t skip_sort_threshold = 8;
+   *  query-major order.
+   *
+   *  Production default is 2 — i.e. skip the sort only at coresidency = 1
+   *  (the absolute minimum, where there's no parallelism in sorted pairs to
+   *  exploit anyway). Above coresidency = 1 the cluster-major sort wins
+   *  decisively because the per-cluster bulk reads coalesce across blocks
+   *  scanning the same cluster.
+   *
+   *  An L40S sweep across {wiki_all, gist, imagenet, openai_1536_5M} ×
+   *  bs ∈ {1, 10, 100, 1000} × nprobe ∈ {1, 5, 10, 50, 100, 200} found:
+   *    - cor=1 (148 rows): ss=2 ≈ ss=8, both ~+2.5% median over ss=0
+   *    - cor=2-7 (30 rows): ss=2 ≈ ss=0; ss=4 = -19% median; ss=8 = -34% median
+   *    - cor>=8 (14 rows): all variants ≈ ss=0 (sort engages)
+   *  Worst single regression at ss=8 was -71% (wiki bs=1000 np=200 cor=5).
+   *
+   *  Set to 0 to never skip (always sort). Larger values are not recommended
+   *  in production. */
+  uint32_t skip_sort_threshold = 2;
   /** See `ip_variant_kind`. Default `auto_` runs the per-block hybrid
    *  dispatch; the other values force one path for ablation. */
   ip_variant_kind ip_variant = ip_variant_kind::auto_;
-  /** See `centroid_select_kind`. Default `auto_policy` picks the best
-   *  raft::matrix::SelectAlgo for our shape (kWarpDistributedShm at small k,
-   *  kAuto fallback at k > 256). */
+  /** See `centroid_select_kind`. Default `auto_policy` defers to raft's
+   *  `kAuto` heuristic. */
   centroid_select_kind centroid_select = centroid_select_kind::auto_policy;
 };
 /**

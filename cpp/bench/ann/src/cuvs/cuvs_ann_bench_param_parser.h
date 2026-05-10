@@ -278,10 +278,13 @@ void parse_search_param(const nlohmann::json& conf,
     } else if (sel == "warp_distributed_shm") {
       param.rabitq_param.centroid_select =
         cuvs::neighbors::ivf_rabitq::centroid_select_kind::warp_distributed_shm;
+    } else if (sel == "radix11bits") {
+      param.rabitq_param.centroid_select =
+        cuvs::neighbors::ivf_rabitq::centroid_select_kind::radix11bits;
     } else {
       throw std::runtime_error(
         "centroid_select: '" + sel +
-        "', should be 'auto_policy', 'kauto', or 'warp_distributed_shm'");
+        "', should be 'auto_policy', 'kauto', 'warp_distributed_shm', or 'radix11bits'");
     }
   }
 }

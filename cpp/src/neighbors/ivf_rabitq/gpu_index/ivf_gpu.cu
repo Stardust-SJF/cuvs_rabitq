@@ -1277,23 +1277,27 @@ void IVFGPU::PrepareClusterSearchInputs(
 
   // Step 4: select top-nprobe clusters per query.
   //
-  // Algorithm choice: raft's kAuto heuristic at our shape (batch_size small,
-  // num_centroids ≈ 4096, k = nprobe) picks kWarpImmediate. End-to-end sweep
-  // showed kWarpDistributedShm wins by 0.7-2.8% kQPS at small NQ with parity
-  // at NQ ≥ 100. raft warpsort's kMaxCapacity = 256, so fall back to kAuto
-  // when nprobe exceeds that. Recall is bit-identical across variants.
+  // Algorithm choice: defer to raft's kAuto for the production default. A
+  // diagnostic sweep (kauto / warp_distributed_shm / radix11bits across
+  // nprobe ∈ [64, 400] on wiki_all bs=1000) showed all three variants
+  // produce within-noise QPS at every nprobe — the choice of select_k
+  // algorithm is essentially neutral at our typical shape. The 2-3× cliff
+  // observed at nprobe ≈ 250 is rooted elsewhere (the skip-sort threshold
+  // boundary, not select_k).
+  //
+  // The forced-algorithm enum values are retained for ablation only.
   raft::matrix::SelectAlgo select_algo;
   switch (centroid_sel) {
-    case centroid_select_kind::kauto:
-      select_algo = raft::matrix::SelectAlgo::kAuto;
-      break;
     case centroid_select_kind::warp_distributed_shm:
       select_algo = raft::matrix::SelectAlgo::kWarpDistributedShm;
       break;
+    case centroid_select_kind::radix11bits:
+      select_algo = raft::matrix::SelectAlgo::kRadix11bits;
+      break;
     case centroid_select_kind::auto_policy:
+    case centroid_select_kind::kauto:
     default:
-      select_algo = (nprobe <= 256) ? raft::matrix::SelectAlgo::kWarpDistributedShm
-                                    : raft::matrix::SelectAlgo::kAuto;
+      select_algo = raft::matrix::SelectAlgo::kAuto;
       break;
   }
   auto d_raft_vals = raft::make_device_matrix<float, int64_t>(handle_, batch_size, nprobe);

@@ -295,7 +295,7 @@ class IVFGPU {
     threshold_strategy strategy        = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale       = 1.5f,
     bool enable_dynamic_block          = true,
-    uint32_t skip_sort_threshold       = 8,
+    uint32_t skip_sort_threshold       = 2,
     ip_variant_kind ip_variant         = ip_variant_kind::auto_,
     centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
 
@@ -311,7 +311,7 @@ class IVFGPU {
     threshold_strategy strategy        = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale       = 1.5f,
     bool enable_dynamic_block          = true,
-    uint32_t skip_sort_threshold       = 8,
+    uint32_t skip_sort_threshold       = 2,
     ip_variant_kind ip_variant         = ip_variant_kind::auto_,
     centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
 

@@ -138,9 +138,25 @@ static inline uint32_t compute_dynamic_block_dim(size_t num_queries,
          n_threads < cap) {
     n_threads *= 2;
   }
-  // Loop D
+  // Loop D — bump to 512 at small nprobe when the grid is small enough that
+  // even the floor block size (kSearchKernelMinBlockDim = 256) would
+  // underfill the device. The bigger block recruits otherwise-idle warps
+  // for the ex-code re-rank stage's warp-per-candidate parallelism.
+  //
+  // The underutilization check is critical: at large batch_size the grid is
+  // already huge (~100k blocks across ~142 SMs), and bumping blockDim from
+  // 256 → 512 only reduces per-SM occupancy without finding any idle warps
+  // to recruit. Empirically this caused a 10% perf cliff at np=10 vs np=12
+  // on openai_1536_5M / bs=10000 / quant4 / bits_per_dim=8 (where the
+  // kernel is shmem-heavy, so larger blocks drop occupancy hard).
   const size_t nprobe = (num_queries > 0) ? (num_pairs / num_queries) : 0;
-  if (nprobe <= 10 && n_threads < 512u && cap >= 512u) { n_threads = 512u; }
+  const size_t device_thread_capacity =
+    static_cast<size_t>(dev_props.multiProcessorCount) * dev_props.maxThreadsPerMultiProcessor;
+  const bool device_underfilled_at_floor =
+    num_pairs * static_cast<size_t>(kSearchKernelMinBlockDim) < device_thread_capacity;
+  if (nprobe <= 10 && n_threads < 512u && cap >= 512u && device_underfilled_at_floor) {
+    n_threads = 512u;
+  }
   if (n_threads > cap) n_threads = cap;
   if (n_threads < kSearchKernelMinBlockDim) n_threads = kSearchKernelMinBlockDim;
   if (n_threads > cap) n_threads = cap;  // floor may exceed cap on a tiny kernel
