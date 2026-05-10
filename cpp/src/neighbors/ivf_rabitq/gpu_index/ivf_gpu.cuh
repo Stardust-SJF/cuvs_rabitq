@@ -295,7 +295,7 @@ class IVFGPU {
     threshold_strategy strategy        = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale       = 1.5f,
     bool enable_dynamic_block          = true,
-    uint32_t skip_sort_threshold       = 2,
+    uint32_t min_sort_pairs           = 1000,
     ip_variant_kind ip_variant         = ip_variant_kind::auto_,
     centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
 
@@ -311,7 +311,7 @@ class IVFGPU {
     threshold_strategy strategy        = threshold_strategy::centroid_reorder,
     float centroid_reorder_scale       = 1.5f,
     bool enable_dynamic_block          = true,
-    uint32_t skip_sort_threshold       = 2,
+    uint32_t min_sort_pairs           = 1000,
     ip_variant_kind ip_variant         = ip_variant_kind::auto_,
     centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
 
@@ -319,8 +319,8 @@ class IVFGPU {
   // d_raft_idx_out exposes raft::matrix::select_k's query-major output so that
   // CENTROID_REORDER threshold seeding can sample the topk-th nearest cluster
   // per query. Caller passes a device_matrix shaped (batch_size, nprobe).
-  // skip_sort_threshold > 0: when (batch_size * nprobe) / num_centroids is
-  // below this, build d_sorted_pairs query-major instead of cluster-major.
+  // min_sort_pairs > 0: when batch_size * nprobe is below this, build
+  // d_sorted_pairs query-major instead of running a cluster-major sort.
   void PrepareClusterSearchInputs(
     const float* d_query,
     size_t batch_size,
@@ -330,7 +330,7 @@ class IVFGPU {
     raft::device_vector<float, int64_t>& d_G_k1xSumq,
     raft::device_vector<float, int64_t>& d_G_kbxSumq,
     raft::device_matrix<int, int64_t>& d_raft_idx_out,
-    uint32_t skip_sort_threshold      = 0,
+    uint32_t min_sort_pairs           = 0,
     centroid_select_kind centroid_sel = centroid_select_kind::auto_policy);
 
   /**

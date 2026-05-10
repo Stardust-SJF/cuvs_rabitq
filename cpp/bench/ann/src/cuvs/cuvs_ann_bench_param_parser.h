@@ -251,8 +251,8 @@ void parse_search_param(const nlohmann::json& conf,
   if (conf.contains("enable_dynamic_block")) {
     param.rabitq_param.enable_dynamic_block = conf.at("enable_dynamic_block");
   }
-  if (conf.contains("skip_sort_threshold")) {
-    param.rabitq_param.skip_sort_threshold = conf.at("skip_sort_threshold");
+  if (conf.contains("min_sort_pairs")) {
+    param.rabitq_param.min_sort_pairs = conf.at("min_sort_pairs");
   }
   if (conf.contains("ip_variant")) {
     std::string variant = conf.at("ip_variant");

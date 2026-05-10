@@ -1228,7 +1228,7 @@ void IVFGPU::PrepareClusterSearchInputs(
   raft::device_vector<float, int64_t>& d_G_k1xSumq,
   raft::device_vector<float, int64_t>& d_G_kbxSumq,
   raft::device_matrix<int, int64_t>& d_raft_idx_out,
-  uint32_t skip_sort_threshold,
+  uint32_t min_sort_pairs,
   centroid_select_kind centroid_sel)
 {
   // Step 1: Compute -2 * Q * C^T using RAFT wrapper for cuBLASLt
@@ -1316,18 +1316,16 @@ void IVFGPU::PrepareClusterSearchInputs(
   // Step 5: build (cluster, query) pairs.
   //
   // Cluster-major sort (the default) groups all blocks scanning the same
-  // cluster together, which gives L2 reuse on the per-cluster bulk reads. At
-  // small batch / small nprobe coresidency = ceil(batch_size * nprobe /
-  // num_centroids) is so low that the sort can't amortise its own cost over
-  // the reuse it would create — we then build pairs query-major directly
-  // from raft::matrix::select_k's output.
+  // cluster together, which gives L2 reuse on the per-cluster bulk reads.
+  // At small total pair counts the sort overhead exceeds the reuse benefit
+  // and we fall back to a single fused kernel that emits pairs in
+  // query-major order, built directly from raft::matrix::select_k's output.
+  // The cutover (min_sort_pairs) is on absolute pair count, not coresidency
+  // — coresidency conflates regimes when n_lists varies across datasets.
   d_sorted_pairs =
     raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, batch_size * nprobe);
-  bool skip_sort = false;
-  if (skip_sort_threshold > 0) {
-    size_t coresidency = (batch_size * nprobe + num_centroids - 1) / num_centroids;
-    if (coresidency < skip_sort_threshold) { skip_sort = true; }
-  }
+  const size_t num_pairs = batch_size * nprobe;
+  const bool skip_sort   = (min_sort_pairs > 0 && num_pairs < min_sort_pairs);
   if (skip_sort) {
     int total_pairs   = static_cast<int>(batch_size * nprobe);
     const int threads = 256;
@@ -1401,7 +1399,7 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                      threshold_strategy strategy,
                                      float centroid_reorder_scale,
                                      bool enable_dynamic_block,
-                                     uint32_t skip_sort_threshold,
+                                     uint32_t min_sort_pairs,
                                      ip_variant_kind ip_variant,
                                      centroid_select_kind centroid_sel)
 {
@@ -1418,7 +1416,7 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
                              d_raft_idx,
-                             skip_sort_threshold,
+                             min_sort_pairs,
                              centroid_sel);
   searcher_batch->SearchClusterQueryPairsSharedMemOpt(*this,
                                                       cluster_meta_.data_handle(),
@@ -1449,7 +1447,7 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                              threshold_strategy strategy,
                                              float centroid_reorder_scale,
                                              bool enable_dynamic_block,
-                                             uint32_t skip_sort_threshold,
+                                             uint32_t min_sort_pairs,
                                              ip_variant_kind ip_variant,
                                              centroid_select_kind centroid_sel)
 {
@@ -1466,7 +1464,7 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
                              d_raft_idx,
-                             skip_sort_threshold,
+                             min_sort_pairs,
                              centroid_sel);
   searcher_batch->SearchClusterQueryPairsQuantizeQuery(*this,
                                                        cluster_meta_.data_handle(),

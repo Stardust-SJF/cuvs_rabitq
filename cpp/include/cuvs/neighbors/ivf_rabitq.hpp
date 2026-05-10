@@ -196,27 +196,34 @@ struct search_params : cuvs::neighbors::search_params {
    *  to 512 at small nprobe). Floored at 256, capped at the kernel's
    *  maxThreadsPerBlock. When false, blockDim is the tuned default (256). */
   bool enable_dynamic_block = true;
-  /** Coresidency-conditional sort skip. When `(num_queries * n_probes) /
-   *  n_lists < skip_sort_threshold`, the cluster-major sort of (cluster,
-   *  query) pairs is replaced by a single fused kernel that emits pairs in
-   *  query-major order.
+  /** Pair-count threshold for the cluster-major sort. When `num_queries *
+   *  n_probes < min_sort_pairs`, the sort is replaced by a single fused
+   *  kernel that emits pairs in query-major order.
    *
-   *  Production default is 2 — i.e. skip the sort only at coresidency = 1
-   *  (the absolute minimum, where there's no parallelism in sorted pairs to
-   *  exploit anyway). Above coresidency = 1 the cluster-major sort wins
-   *  decisively because the per-cluster bulk reads coalesce across blocks
-   *  scanning the same cluster.
+   *  The cluster-major sort gives L2 reuse on the per-cluster bulk reads
+   *  (multiple blocks scanning the same cluster share its data in L2);
+   *  this benefit grows with the total number of (cluster, query) pairs.
+   *  At small pair counts the sort overhead exceeds the reuse benefit and
+   *  the simpler query-major fused build is faster.
    *
-   *  An L40S sweep across {wiki_all, gist, imagenet, openai_1536_5M} ×
-   *  bs ∈ {1, 10, 100, 1000} × nprobe ∈ {1, 5, 10, 50, 100, 200} found:
-   *    - cor=1 (148 rows): ss=2 ≈ ss=8, both ~+2.5% median over ss=0
-   *    - cor=2-7 (30 rows): ss=2 ≈ ss=0; ss=4 = -19% median; ss=8 = -34% median
-   *    - cor>=8 (14 rows): all variants ≈ ss=0 (sort engages)
-   *  Worst single regression at ss=8 was -71% (wiki bs=1000 np=200 cor=5).
+   *  Production default is 1000 — picked from an L40S sweep across
+   *  {wiki_all, gist, imagenet, openai_1536_5M} × bs ∈ {1, 10, 100, 1000}
+   *  × nprobe ∈ {1, 5, 10, 50, 100, 200}. The crossover landed at
+   *  num_pairs ≈ 1000:
+   *    num_pairs <  200: skip-sort wins +4.9% avg
+   *    num_pairs <  1k : skip-sort wins +3.4% avg
+   *    num_pairs 1-5k  : within ±2% (break-even)
+   *    num_pairs ≥ 5k  : sort wins by 5-25%
    *
-   *  Set to 0 to never skip (always sort). Larger values are not recommended
-   *  in production. */
-  uint32_t skip_sort_threshold = 2;
+   *  An earlier coresidency-based rule (`coresidency < threshold`) was
+   *  retired because it conflated regimes when `n_lists` varied across
+   *  datasets — at coresidency=1 on wiki_all (n_lists=40000), num_pairs
+   *  could be up to 40k where sort wins decisively, while on gist
+   *  (n_lists=4096) cor=1 capped at 4k pairs where skip-sort genuinely
+   *  helps. The pair-count rule treats both cleanly.
+   *
+   *  Set to 0 to always sort. */
+  uint32_t min_sort_pairs = 1000;
   /** See `ip_variant_kind`. Default `auto_` runs the per-block hybrid
    *  dispatch; the other values force one path for ablation. */
   ip_variant_kind ip_variant = ip_variant_kind::auto_;

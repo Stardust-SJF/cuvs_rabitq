@@ -255,7 +255,7 @@ void search(raft::resources const& handle,
                                                params.strategy,
                                                params.centroid_reorder_scale,
                                                params.enable_dynamic_block,
-                                               params.skip_sort_threshold,
+                                               params.min_sort_pairs,
                                                params.ip_variant,
                                                params.centroid_select);
   } else if (params.mode == search_mode::QUANT8) {
@@ -270,7 +270,7 @@ void search(raft::resources const& handle,
                                                        params.strategy,
                                                        params.centroid_reorder_scale,
                                                        params.enable_dynamic_block,
-                                                       params.skip_sort_threshold,
+                                                       params.min_sort_pairs,
                                                        params.ip_variant,
                                                        params.centroid_select);
   } else if (params.mode == search_mode::QUANT4) {
@@ -285,7 +285,7 @@ void search(raft::resources const& handle,
                                                        params.strategy,
                                                        params.centroid_reorder_scale,
                                                        params.enable_dynamic_block,
-                                                       params.skip_sort_threshold,
+                                                       params.min_sort_pairs,
                                                        params.ip_variant,
                                                        params.centroid_select);
   }
