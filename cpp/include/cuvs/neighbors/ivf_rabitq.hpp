@@ -206,14 +206,14 @@ struct search_params : cuvs::neighbors::search_params {
    *  At small pair counts the sort overhead exceeds the reuse benefit and
    *  the simpler query-major fused build is faster.
    *
-   *  Production default is 1000 — picked from an L40S sweep across
+   *  Production default is 2000 — picked from an L40S sweep across
    *  {wiki_all, gist, imagenet, openai_1536_5M} × bs ∈ {1, 10, 100, 1000}
-   *  × nprobe ∈ {1, 5, 10, 50, 100, 200}. The crossover landed at
-   *  num_pairs ≈ 1000:
-   *    num_pairs <  200: skip-sort wins +4.9% avg
-   *    num_pairs <  1k : skip-sort wins +3.4% avg
-   *    num_pairs 1-5k  : within ±2% (break-even)
-   *    num_pairs ≥ 5k  : sort wins by 5-25%
+   *  × nprobe ∈ {1, 5, 10, 50, 100, 200}. The crossover landed near
+   *  num_pairs ≈ 2000:
+   *    num_pairs <  200 : skip-sort wins +4.9% avg
+   *    num_pairs <  1k  : skip-sort wins +3.4% avg
+   *    num_pairs 1k-2k  : skip-sort still mostly wins (per-row median +2% at NQ=10)
+   *    num_pairs ≥ 2k   : sort wins (7-14% at NQ=10 on wiki/gist; up to 25% at higher NQ)
    *
    *  Independently of this threshold, the sort is always skipped when
    *  `num_queries == 1` — at NQ=1 each cluster is visited at most once so
@@ -221,7 +221,7 @@ struct search_params : cuvs::neighbors::search_params {
    *  is pure overhead regardless of pair count.
    *
    *  Set to 0 to disable the pair-count gate (still skips at NQ=1). */
-  uint32_t min_sort_pairs = 1000;
+  uint32_t min_sort_pairs = 2000;
   /** See `ip_variant_kind`. Default `auto_` runs the per-block hybrid
    *  dispatch; the other values force one path for ablation. */
   ip_variant_kind ip_variant = ip_variant_kind::auto_;
