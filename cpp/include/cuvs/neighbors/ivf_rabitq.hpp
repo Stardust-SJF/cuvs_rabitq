@@ -215,14 +215,12 @@ struct search_params : cuvs::neighbors::search_params {
    *    num_pairs 1-5k  : within ±2% (break-even)
    *    num_pairs ≥ 5k  : sort wins by 5-25%
    *
-   *  An earlier coresidency-based rule (`coresidency < threshold`) was
-   *  retired because it conflated regimes when `n_lists` varied across
-   *  datasets — at coresidency=1 on wiki_all (n_lists=40000), num_pairs
-   *  could be up to 40k where sort wins decisively, while on gist
-   *  (n_lists=4096) cor=1 capped at 4k pairs where skip-sort genuinely
-   *  helps. The pair-count rule treats both cleanly.
+   *  Independently of this threshold, the sort is always skipped when
+   *  `num_queries == 1` — at NQ=1 each cluster is visited at most once so
+   *  there is no co-residency to amortise the sort against, and the sort
+   *  is pure overhead regardless of pair count.
    *
-   *  Set to 0 to always sort. */
+   *  Set to 0 to disable the pair-count gate (still skips at NQ=1). */
   uint32_t min_sort_pairs = 1000;
   /** See `ip_variant_kind`. Default `auto_` runs the per-block hybrid
    *  dispatch; the other values force one path for ablation. */

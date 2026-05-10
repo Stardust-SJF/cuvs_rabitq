@@ -1320,12 +1320,18 @@ void IVFGPU::PrepareClusterSearchInputs(
   // At small total pair counts the sort overhead exceeds the reuse benefit
   // and we fall back to a single fused kernel that emits pairs in
   // query-major order, built directly from raft::matrix::select_k's output.
-  // The cutover (min_sort_pairs) is on absolute pair count, not coresidency
-  // — coresidency conflates regimes when n_lists varies across datasets.
+  //
+  // Two skip conditions:
+  //   1. batch_size == 1: only one query, so each cluster is visited at most
+  //      once and there's zero co-residency to amortise the sort against.
+  //      Sort is pure overhead at NQ=1.
+  //   2. num_pairs < min_sort_pairs: at small total work the sort overhead
+  //      exceeds the reuse benefit even when co-residency is possible.
   d_sorted_pairs =
     raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, batch_size * nprobe);
   const size_t num_pairs = batch_size * nprobe;
-  const bool skip_sort   = (min_sort_pairs > 0 && num_pairs < min_sort_pairs);
+  const bool skip_sort =
+    (batch_size == 1) || (min_sort_pairs > 0 && num_pairs < min_sort_pairs);
   if (skip_sort) {
     int total_pairs   = static_cast<int>(batch_size * nprobe);
     const int threads = 256;
