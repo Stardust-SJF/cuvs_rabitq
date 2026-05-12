@@ -316,25 +316,34 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
           }
         }
       } else {
-        // ----- Path B: warp-per-candidate (branchless multiply-by-bool) -----
+        // ----- Path B: warp-per-candidate (lane-parallel bit, conflict-free) -----
+        //
+        // The previous design had each lane own a different *word* of the
+        // code (uint32_idx = lid; uint32_idx += WarpSize). The inner per-bit
+        // loop read shared_query[uint32_idx * 32 + bit_idx], which is stride
+        // 32 floats across lanes → all 32 lanes hit the same shared-memory
+        // bank → 24-way bank conflict on every LDS (and the #pragma unroll 8
+        // amplified to 8 conflicted LDS per iteration).
+        //
+        // This rewrite has all 32 lanes share uint32_idx (uniform outer loop)
+        // and partitions the 32 bit positions of each word across lanes. The
+        // shared_query access becomes shared_query[uint32_idx * 32 + lid] —
+        // stride 1, no bank conflict. The per-word short_code_chunk global
+        // load is also a broadcast (1 wavefront) instead of 32 strided loads.
         const int wid = tid / raft::WarpSize;
         const int lid = tid % raft::WarpSize;
         for (int cand_idx = wid; cand_idx < static_cast<int>(num_candidates);
              cand_idx += num_warps_p2) {
           int vec_idx    = shared_candidate_indices[cand_idx];
           float exact_ip = 0.0f;
-          for (size_t uint32_idx = lid; uint32_idx < short_code_length;
-               uint32_idx += raft::WarpSize) {
+          for (size_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
             size_t short_code_offset = cluster_start_index * short_code_length +
                                        uint32_idx * num_vectors_in_cluster + vec_idx;
             uint32_t short_code_chunk = params.d_short_data[short_code_offset];
-#pragma unroll 8
-            for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
-              size_t dim = uint32_idx * 32 + bit_idx;
-              if (dim < params.D) {
-                float bv = static_cast<float>((short_code_chunk >> (31 - bit_idx)) & 0x1u);
-                exact_ip += bv * shared_query[dim];
-              }
+            size_t dim = uint32_idx * 32 + lid;
+            if (dim < params.D) {
+              float bv = static_cast<float>((short_code_chunk >> (31 - lid)) & 0x1u);
+              exact_ip += bv * shared_query[dim];
             }
           }
 #pragma unroll
