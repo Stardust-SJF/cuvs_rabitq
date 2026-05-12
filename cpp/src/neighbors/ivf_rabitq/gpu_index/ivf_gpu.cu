@@ -977,6 +977,56 @@ void IVFGPU::quantize_cluster(GPUClusterMeta& cp,
                          d_rotated_c);
 }
 
+// Custom centroid-IP kernel for the [N×D]·[D×K] gemv at small N (NQ=1 search).
+// At NQ=1 the cuBLASLt centroid-IP path dispatches `gemv2T_kernel_ref` (~30-45 µs
+// avg on L40S at K=4096, D=768) — a cuBLASLt heuristic miss we cannot redirect
+// from the API. This kernel processes each centroid row with one warp (32 lanes
+// split the D-dim dot product), and loads the query into shared once per block.
+//
+// Layout: queries [N×D] row-major; centroids [K×D] row-major (each centroid is
+// a contiguous D-float row); dist [N×K] row-major.
+template <int BlockSize>
+__global__ void centroid_ip_warp_per_row_kernel(const float* __restrict__ queries,
+                                                const float* __restrict__ centroids,
+                                                float* __restrict__       dist,
+                                                float                     alpha,
+                                                int                       D,
+                                                int                       K,
+                                                int                       N)
+{
+  constexpr int kWarpSize      = 32;
+  constexpr int kWarpsPerBlock = BlockSize / kWarpSize;
+  extern __shared__ float       s_query[];  // D floats
+
+  const int tid       = threadIdx.x;
+  const int warp_id   = tid / kWarpSize;
+  const int lane      = tid % kWarpSize;
+  const int query_idx = blockIdx.y;
+  if (query_idx >= N) return;
+
+  const float* q = queries + static_cast<size_t>(query_idx) * D;
+  for (int d = tid; d < D; d += BlockSize) {
+    s_query[d] = q[d];
+  }
+  __syncthreads();
+
+  const int k = blockIdx.x * kWarpsPerBlock + warp_id;
+  if (k >= K) return;
+
+  const float* c   = centroids + static_cast<size_t>(k) * D;
+  float        acc = 0.0f;
+  for (int d = lane; d < D; d += kWarpSize) {
+    acc = fmaf(c[d], s_query[d], acc);
+  }
+#pragma unroll
+  for (int off = kWarpSize / 2; off > 0; off >>= 1) {
+    acc += __shfl_down_sync(0xffffffff, acc, off);
+  }
+  if (lane == 0) {
+    dist[static_cast<size_t>(query_idx) * K + k] = alpha * acc;
+  }
+}
+
 // Launch with: grid = Q + K (or a grid-stride size), block = norm_block_size
 // shared mem bytes = ((norm_block_size + 31) / 32) * sizeof(float)
 
@@ -1232,23 +1282,66 @@ void IVFGPU::PrepareClusterSearchInputs(
   uint32_t min_sort_pairs,
   centroid_select_kind centroid_sel)
 {
-  // Step 1: Compute -2 * Q * C^T using RAFT wrapper for cuBLASLt
-  const float alpha = -2.f, beta = 0.f;
-  raft::linalg::detail::matmul</* DevicePointerMode = */ true>(
-    handle_,
-    /* trans_a = */ true,
-    /* trans_b = */ false,
-    num_centroids,
-    batch_size,
-    num_padded_dim,
-    &alpha,
-    initializer->GetCentroid(0),
-    num_padded_dim,
-    d_query,
-    num_padded_dim,
-    &beta,
-    searcher_batch->get_centroid_distances(),
-    num_centroids);
+  // Step 1: Compute -2 * Q * C^T. At small batch_size (NQ=1 search) the cuBLASLt
+  // path dispatched the slow `gemv2T_kernel_ref` (~30-45 µs avg on L40S at
+  // K=4096, D=768); use a custom warp-per-row kernel below the crossover. cuBLAS
+  // keeps winning at large batch sizes (training / large-batch search).
+  const float alpha = -2.f;
+  // Crossover study (codesearchnet K=4096 D=768 on L40S, May 2026; 3-trial
+  // median, nprobe=100, end-to-end µs/query):
+  //   NQ=1  custom 198 / cuBLAS 222   custom -24    custom wins decisively
+  //   NQ=2  custom 116 / cuBLAS 105   cuBLAS -11    cuBLAS p50, but bimodal
+  //   NQ=4  custom  65 / cuBLAS  69   custom  -5    custom + stabler tail
+  //   NQ=8  custom  42 / cuBLAS  44   custom  -2    custom + stabler tail
+  //   NQ=10 custom  45 / cuBLAS  23   cuBLAS -22    cuBLAS clearly faster
+  //   NQ=16 custom  32 / cuBLAS  15   cuBLAS -17    cuBLAS clearly faster
+  // cuBLAS dispatches `gemv2T_kernel_ref` at NQ=1 (heuristic miss, ~40 µs/call)
+  // and `gemmSN_TN_kernel` at NQ≥2 (bimodal: median 27 µs, but sporadic 3 ms
+  // outliers from cuBLASLt heuristic re-search). Custom warp-per-row scales
+  // linearly but is rock-stable (<1% trial variance). At NQ≤8 they're close
+  // at p50; custom wins p99 thanks to stable latency. At NQ≥10 cuBLAS hits a
+  // regime change and wins by 2×.
+  constexpr size_t kSmallBatchCutoff = 8;
+  if (batch_size <= kSmallBatchCutoff && num_padded_dim % 32 == 0) {
+    constexpr int kBlockSize      = 256;
+    constexpr int kWarpsPerBlock  = kBlockSize / 32;
+    dim3 ip_grid(
+      static_cast<unsigned>((num_centroids + kWarpsPerBlock - 1) / kWarpsPerBlock),
+      static_cast<unsigned>(batch_size));
+    size_t ip_shared = static_cast<size_t>(num_padded_dim) * sizeof(float);
+    centroid_ip_warp_per_row_kernel<kBlockSize>
+      <<<ip_grid, kBlockSize, ip_shared, stream_>>>(d_query,
+                                                    initializer->GetCentroid(0),
+                                                    searcher_batch->get_centroid_distances(),
+                                                    alpha,
+                                                    static_cast<int>(num_padded_dim),
+                                                    static_cast<int>(num_centroids),
+                                                    static_cast<int>(batch_size));
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
+  } else {
+    const float beta = 0.f;
+    // DevicePointerMode = true is intentional. Flipping to false at NQ=1
+    // unlocks the fast `gemv2T_kernel_val` (~5 µs/call vs `_ref` at ~40 µs),
+    // but at NQ≥2 it lengthens cuBLASLt host-side dispatch enough to add
+    // ~12 µs/query end-to-end (gemv kernels are stable+faster, but plumbing
+    // is heavier). The custom kernel above already handles NQ=1, so DPM=true
+    // is the better setting for the NQ≥2 path that lands here.
+    raft::linalg::detail::matmul</* DevicePointerMode = */ true>(
+      handle_,
+      /* trans_a = */ true,
+      /* trans_b = */ false,
+      num_centroids,
+      batch_size,
+      num_padded_dim,
+      &alpha,
+      initializer->GetCentroid(0),
+      num_padded_dim,
+      d_query,
+      num_padded_dim,
+      &beta,
+      searcher_batch->get_centroid_distances(),
+      num_centroids);
+  }
 
   // Step 2: fused kernel to compute q and c norms
   int grid                  = num_centroids + batch_size;
