@@ -1228,6 +1228,7 @@ void IVFGPU::PrepareClusterSearchInputs(
   raft::device_vector<float, int64_t>& d_G_k1xSumq,
   raft::device_vector<float, int64_t>& d_G_kbxSumq,
   raft::device_matrix<int, int64_t>& d_raft_idx_out,
+  bool& pairs_query_major,
   uint32_t min_sort_pairs,
   centroid_select_kind centroid_sel)
 {
@@ -1332,6 +1333,11 @@ void IVFGPU::PrepareClusterSearchInputs(
   const size_t num_pairs = batch_size * nprobe;
   const bool skip_sort =
     (batch_size == 1) || (min_sort_pairs > 0 && num_pairs < min_sort_pairs);
+  // skip_sort path emits pairs in query-major order; downstream callers
+  // use this to decide whether the CENTROID_REORDER reorder pipeline can
+  // be bypassed (warmup pairs are already at the front of each query's
+  // slice when query-major).
+  pairs_query_major = skip_sort;
   if (skip_sort) {
     int total_pairs   = static_cast<int>(batch_size * nprobe);
     const int threads = 256;
@@ -1374,6 +1380,7 @@ void IVFGPU::BatchClusterSearch(const float* d_query,
   auto d_G_k1xSumq            = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_G_kbxSumq            = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_raft_idx             = raft::make_device_matrix<int, int64_t>(handle_, 0, 0);
+  bool pairs_query_major      = false;  // unused in legacy BatchClusterSearch
   PrepareClusterSearchInputs(d_query,
                              batch_size,
                              nprobe,
@@ -1381,7 +1388,8 @@ void IVFGPU::BatchClusterSearch(const float* d_query,
                              d_sorted_pairs,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
-                             d_raft_idx);
+                             d_raft_idx,
+                             pairs_query_major);
   searcher_batch->SearchClusterQueryPairs(*this,
                                           cluster_meta_.data_handle(),
                                           d_sorted_pairs.data_handle(),
@@ -1407,13 +1415,15 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                      bool enable_dynamic_block,
                                      uint32_t min_sort_pairs,
                                      ip_variant_kind ip_variant,
-                                     centroid_select_kind centroid_sel)
+                                     centroid_select_kind centroid_sel,
+                                     uint32_t warmup_clusters)
 {
   SearcherGPU* searcher_batch = (SearcherGPU*)searcher;
   auto d_sorted_pairs         = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
   auto d_G_k1xSumq            = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_G_kbxSumq            = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_raft_idx             = raft::make_device_matrix<int, int64_t>(handle_, 0, 0);
+  bool pairs_query_major      = false;
   PrepareClusterSearchInputs(d_query,
                              batch_size,
                              nprobe,
@@ -1422,6 +1432,7 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
                              d_raft_idx,
+                             pairs_query_major,
                              min_sort_pairs,
                              centroid_sel);
   searcher_batch->SearchClusterQueryPairsSharedMemOpt(*this,
@@ -1439,7 +1450,9 @@ void IVFGPU::BatchClusterSearchLUT16(const float* d_query,
                                                       centroid_reorder_scale,
                                                       d_raft_idx.data_handle(),
                                                       enable_dynamic_block,
-                                                      ip_variant);
+                                                      ip_variant,
+                                                      warmup_clusters,
+                                                      pairs_query_major);
 }
 
 void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
@@ -1455,13 +1468,15 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                              bool enable_dynamic_block,
                                              uint32_t min_sort_pairs,
                                              ip_variant_kind ip_variant,
-                                             centroid_select_kind centroid_sel)
+                                             centroid_select_kind centroid_sel,
+                                             uint32_t warmup_clusters)
 {
   SearcherGPU* searcher_batch = (SearcherGPU*)searcher;
   auto d_sorted_pairs         = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
   auto d_G_k1xSumq            = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_G_kbxSumq            = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_raft_idx             = raft::make_device_matrix<int, int64_t>(handle_, 0, 0);
+  bool pairs_query_major      = false;
   PrepareClusterSearchInputs(d_query,
                              batch_size,
                              nprobe,
@@ -1470,6 +1485,7 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                              d_G_k1xSumq,
                              d_G_kbxSumq,
                              d_raft_idx,
+                             pairs_query_major,
                              min_sort_pairs,
                              centroid_sel);
   searcher_batch->SearchClusterQueryPairsQuantizeQuery(*this,
@@ -1488,7 +1504,9 @@ void IVFGPU::BatchClusterSearchQuantizeQuery(const float* d_query,
                                                        centroid_reorder_scale,
                                                        d_raft_idx.data_handle(),
                                                        enable_dynamic_block,
-                                                       ip_variant);
+                                                       ip_variant,
+                                                       warmup_clusters,
+                                                       pairs_query_major);
 }
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

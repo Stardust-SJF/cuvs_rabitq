@@ -18,6 +18,7 @@
 #include <raft/matrix/select_k.cuh>
 
 #include <cub/block/block_reduce.cuh>
+#include <cub/device/device_select.cuh>
 
 #include <thrust/fill.h>
 
@@ -889,7 +890,9 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   float centroid_reorder_scale,
   const int* d_raft_idx,
   bool enable_dynamic_block,
-  ip_variant_kind ip_variant)
+  ip_variant_kind ip_variant,
+  uint32_t warmup_clusters,
+  bool pairs_query_major)
 {
   // check if the inner products kernel should use block sort to keep a top-k priority queue vs.
   // outputting distances from all vectors in probed clusters
@@ -1025,23 +1028,128 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                d_query_write_counters.data_handle() + num_queries,
                0);
 
+  // Number of (cluster, query) pairs to process.
+  size_t num_pairs = num_queries * nprobe;
+
+  // CENTROID_REORDER pipeline workspace. Allocated only when the reorder
+  // path fires; otherwise these stay zero-sized.
+  auto d_warmup_pairs    = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
+  auto d_warmup_per_query = raft::make_device_vector<int, int64_t>(handle_, 0);
+  auto d_keep_flags      = raft::make_device_vector<uint8_t, int64_t>(handle_, 0);
+  auto d_rest_pairs      = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
+  auto d_rest_count      = raft::make_device_vector<int, int64_t>(handle_, 0);
+  auto d_reordered_pairs = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, 0);
+  rmm::device_uvector<uint8_t> d_cub_temp(0, stream_);
+
+  // d_sorted_pairs passed to the main kernel — points either at the
+  // caller's buffer or at the reordered buffer below.
+  const ClusterQueryPair* effective_sorted_pairs = d_sorted_pairs;
+
   if (use_block_sort) {
     if (strategy == threshold_strategy::centroid_reorder && d_raft_idx != nullptr) {
-      // Seed each query's threshold to scale * dist(query, topk-th nearest centroid).
-      // The first cluster scanned by the main kernel can then prune candidates whose
-      // lower-bound exceeds this seed.
-      const int seed_block = 256;
-      const int seed_grid  = (num_queries + seed_block - 1) / seed_block;
-      seed_threshold_from_centroid_kernel<<<seed_grid, seed_block, 0, stream_>>>(
-        d_raft_idx,
-        get_centroid_distances(),
-        d_topk_threshold_batch.data_handle(),
-        num_queries,
-        cur_ivf.get_num_centroids(),
-        nprobe,
-        topk,
-        centroid_reorder_scale);
-      RAFT_CUDA_TRY(cudaPeekAtLastError());
+      // CENTROID_REORDER applies. Two sub-paths:
+      //   (a) Full reorder: seed each query's threshold AND promote each query's
+      //       `warmup_clusters` nearest clusters to a query-major warmup pass at
+      //       the front of d_sorted_pairs. After the warmup wave runs, each
+      //       query's threshold has been tightened against its own nearest
+      //       clusters' actual top-k — so the rest pass (cluster-major) prunes
+      //       more aggressively.
+      //   (b) Bypass (NQ=1 with already-query-major pairs, or warmup_clusters=0,
+      //       or warmup_clusters>=nprobe): just seed the threshold; the existing
+      //       d_sorted_pairs ordering already has warmup pairs at the front of
+      //       each query's slice (for NQ=1, the entire buffer IS one query's
+      //       slice already sorted by distance).
+      const bool reorder_redundant = pairs_query_major && (num_queries == 1);
+      const bool reorder_active =
+        (warmup_clusters > 0) && (warmup_clusters < nprobe) && !reorder_redundant;
+
+      if (reorder_active) {
+        // Allocate reorder workspace.
+        d_warmup_pairs =
+          raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, num_queries * warmup_clusters);
+        d_warmup_per_query =
+          raft::make_device_vector<int, int64_t>(handle_, num_queries * warmup_clusters);
+        d_keep_flags     = raft::make_device_vector<uint8_t, int64_t>(handle_, num_pairs);
+        d_rest_pairs     = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, num_pairs);
+        d_rest_count     = raft::make_device_vector<int, int64_t>(handle_, 1);
+        d_reordered_pairs = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, num_pairs);
+
+        // 1. Fused: seed threshold + build query-major warmup_pairs + flat warmup_per_query.
+        const int fb           = 256;
+        const int total_warmup = static_cast<int>(num_queries * warmup_clusters);
+        const int fg           = (total_warmup + fb - 1) / fb;
+        fused_seed_warmup_kernel<<<fg, fb, 0, stream_>>>(d_raft_idx,
+                                                          get_centroid_distances(),
+                                                          d_warmup_pairs.data_handle(),
+                                                          d_warmup_per_query.data_handle(),
+                                                          d_topk_threshold_batch.data_handle(),
+                                                          num_queries,
+                                                          cur_ivf.get_num_centroids(),
+                                                          nprobe,
+                                                          topk,
+                                                          warmup_clusters,
+                                                          centroid_reorder_scale,
+                                                          /*emit_seed=*/true);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+        // 2. Mark non-warmup pairs in d_sorted_pairs (1 byte per pair).
+        const int mb = 256;
+        const int mg = static_cast<int>((num_pairs + mb - 1) / mb);
+        fused_mark_keep_kernel<<<mg, mb, 0, stream_>>>(d_sorted_pairs,
+                                                       d_warmup_per_query.data_handle(),
+                                                       d_keep_flags.data_handle(),
+                                                       num_pairs,
+                                                       warmup_clusters);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+        // 3. Compact rest pairs (cluster-major order preserved) via DeviceSelect.
+        size_t cub_temp_bytes = 0;
+        cub::DeviceSelect::Flagged(nullptr,
+                                   cub_temp_bytes,
+                                   d_sorted_pairs,
+                                   d_keep_flags.data_handle(),
+                                   d_rest_pairs.data_handle(),
+                                   d_rest_count.data_handle(),
+                                   static_cast<int>(num_pairs),
+                                   stream_);
+        d_cub_temp.resize(cub_temp_bytes, stream_);
+        cub::DeviceSelect::Flagged(d_cub_temp.data(),
+                                   cub_temp_bytes,
+                                   d_sorted_pairs,
+                                   d_keep_flags.data_handle(),
+                                   d_rest_pairs.data_handle(),
+                                   d_rest_count.data_handle(),
+                                   static_cast<int>(num_pairs),
+                                   stream_);
+
+        // 4. Concatenate [warmup ++ rest] → d_reordered_pairs.
+        const size_t warmup_n = num_queries * warmup_clusters;
+        const size_t rest_n   = num_pairs - warmup_n;
+        const int cb         = 256;
+        const int cg         = static_cast<int>((num_pairs + cb - 1) / cb);
+        concat_pairs_kernel<<<cg, cb, 0, stream_>>>(d_warmup_pairs.data_handle(),
+                                                    d_rest_pairs.data_handle(),
+                                                    d_reordered_pairs.data_handle(),
+                                                    warmup_n,
+                                                    rest_n);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+        effective_sorted_pairs = d_reordered_pairs.data_handle();
+      } else {
+        // Bypass: just seed the threshold (no reorder).
+        const int seed_block = 256;
+        const int seed_grid  = (num_queries + seed_block - 1) / seed_block;
+        seed_threshold_from_centroid_kernel<<<seed_grid, seed_block, 0, stream_>>>(
+          d_raft_idx,
+          get_centroid_distances(),
+          d_topk_threshold_batch.data_handle(),
+          num_queries,
+          cur_ivf.get_num_centroids(),
+          nprobe,
+          topk,
+          centroid_reorder_scale);
+        RAFT_CUDA_TRY(cudaPeekAtLastError());
+      }
     } else {
       // strategy == none: fall back to +infinity (admit-all on first cluster).
       thrust::fill(thrust::cuda::par.on(stream_),
@@ -1052,7 +1160,6 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   }
 
   // Launch modified kernel with packed queries instead of LUT
-  size_t num_pairs = num_queries * nprobe;
   uint32_t gridDim{static_cast<uint32_t>(num_pairs)};
   uint32_t blockDim{256};
   if (enable_dynamic_block) {
@@ -1085,7 +1192,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     max(packed_query_size + candidate_storage + query_storage, (size_t)queue_buffer_smem_bytes);
 
   ComputeInnerProductsKernelParams kernelParams;
-  kernelParams.d_sorted_pairs          = d_sorted_pairs;
+  kernelParams.d_sorted_pairs          = effective_sorted_pairs;
   kernelParams.d_query                 = d_query;
   kernelParams.d_short_data            = cur_ivf.get_short_data_device();
   kernelParams.d_cluster_meta          = d_cluster_meta;

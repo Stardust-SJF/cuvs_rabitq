@@ -191,5 +191,114 @@ __global__ inline void seed_threshold_from_centroid_kernel(const int* d_raft_idx
   d_threshold_batch[q] = q_g_add * scale;
 }
 
+// Fused CENTROID_REORDER setup kernel.
+//
+// One launch produces all three setup outputs needed by the reorder pipeline:
+//   - d_warmup_pairs: query-major (cluster, query) pairs for the warmup pass.
+//     For each query q, the first `warmup_clusters` entries are q's nearest
+//     clusters (sourced from d_raft_idx[q, 0..warmup_clusters-1]).
+//   - d_warmup_per_query: same cluster IDs flattened to int[], used by the
+//     mark-keep kernel to test pair membership.
+//   - d_threshold_batch (seed): seeds each query's topk threshold to
+//     `scale * dist(q, topk-th nearest centroid)`. Same semantics as the
+//     standalone seed_threshold_from_centroid_kernel above; this kernel
+//     replaces it when the reorder pipeline is active.
+//
+// Each output is independently nullable; passing nullptr skips that output.
+// The grid launches `num_queries * max(warmup_clusters, 1)` threads.
+__global__ inline void fused_seed_warmup_kernel(const int* d_raft_idx,
+                                                const float* d_centroid_distances,
+                                                ClusterQueryPair* d_warmup_pairs,
+                                                int* d_warmup_per_query,
+                                                float* d_threshold_batch,
+                                                size_t num_queries,
+                                                size_t num_centroids,
+                                                size_t nprobe,
+                                                size_t topk,
+                                                size_t warmup_clusters,
+                                                float scale,
+                                                bool emit_seed)
+{
+  size_t tid = blockIdx.x * blockDim.x + threadIdx.x;
+
+  // Warmup outputs: one thread per (q, k) where k ∈ [0, warmup_clusters).
+  if (warmup_clusters > 0) {
+    size_t total_warmup = num_queries * warmup_clusters;
+    if (tid < total_warmup) {
+      size_t q        = tid / warmup_clusters;
+      size_t k        = tid % warmup_clusters;
+      int cluster_idx = d_raft_idx[q * nprobe + k];
+      if (d_warmup_pairs != nullptr) {
+        d_warmup_pairs[tid].cluster_idx = cluster_idx;
+        d_warmup_pairs[tid].query_idx   = static_cast<int>(q);
+      }
+      if (d_warmup_per_query != nullptr) { d_warmup_per_query[tid] = cluster_idx; }
+    }
+  }
+
+  // Threshold seed: emitted by the k=0 thread of each query (or by tid==q
+  // when warmup_clusters == 0).
+  if (emit_seed && d_threshold_batch != nullptr) {
+    bool emit;
+    size_t q_for_seed;
+    if (warmup_clusters > 0) {
+      emit       = (tid < num_queries * warmup_clusters) && ((tid % warmup_clusters) == 0);
+      q_for_seed = tid / warmup_clusters;
+    } else {
+      emit       = (tid < num_queries);
+      q_for_seed = tid;
+    }
+    if (emit) {
+      size_t seed_rank     = (topk > 0 && topk - 1 < nprobe) ? (topk - 1) : (nprobe - 1);
+      int seed_cluster_idx = d_raft_idx[q_for_seed * nprobe + seed_rank];
+      float q_g_add        = d_centroid_distances[q_for_seed * num_centroids + seed_cluster_idx];
+      d_threshold_batch[q_for_seed] = q_g_add * scale;
+    }
+  }
+}
+
+// Mark which (cluster, query) pairs in d_sorted_pairs are NOT in the warmup
+// set. Output is a byte flag array consumable by cub::DeviceSelect::Flagged
+// to compact the rest pairs (cluster-major order is preserved). `warmup_clusters`
+// is tiny (1-4) so the linear scan over d_warmup_per_query is cheap.
+__global__ inline void fused_mark_keep_kernel(const ClusterQueryPair* d_sorted_pairs,
+                                              const int* d_warmup_per_query,
+                                              uint8_t* d_keep_flags,
+                                              size_t total_pairs,
+                                              size_t warmup_clusters)
+{
+  size_t k = blockIdx.x * blockDim.x + threadIdx.x;
+  if (k >= total_pairs) return;
+  int q          = d_sorted_pairs[k].query_idx;
+  int c          = d_sorted_pairs[k].cluster_idx;
+  bool is_warmup = false;
+  for (size_t i = 0; i < warmup_clusters; ++i) {
+    if (d_warmup_per_query[q * warmup_clusters + i] == c) {
+      is_warmup = true;
+      break;
+    }
+  }
+  d_keep_flags[k] = is_warmup ? 0u : 1u;
+}
+
+// Concatenate warmup_pairs ++ rest_pairs into a single buffer. Warmup pairs
+// land at low blockIdx so they fire in the first wave of the search kernel,
+// tightening per-query thresholds before the rest pairs run.
+__global__ inline void concat_pairs_kernel(const ClusterQueryPair* warmup_pairs,
+                                           const ClusterQueryPair* rest_pairs,
+                                           ClusterQueryPair* dst,
+                                           size_t warmup_n,
+                                           size_t rest_n)
+{
+  size_t tid   = blockIdx.x * blockDim.x + threadIdx.x;
+  size_t total = warmup_n + rest_n;
+  if (tid >= total) return;
+  if (tid < warmup_n) {
+    dst[tid] = warmup_pairs[tid];
+  } else {
+    dst[tid] = rest_pairs[tid - warmup_n];
+  }
+}
+
 }  // namespace
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

@@ -190,6 +190,14 @@ struct search_params : cuvs::neighbors::search_params {
    *  is 1.5 (per upstream sweep across multiple datasets). Ignored when
    *  `strategy == none`. */
   float centroid_reorder_scale = 1.5f;
+  /** Number of nearest clusters per query that the CENTROID_REORDER pipeline
+   *  promotes to a warmup pass, so they fire before the rest of the pairs
+   *  in cluster-major order. The warmup wave tightens each query's topk
+   *  threshold against its own nearest clusters' actual top-k before the
+   *  bulk of the cluster-major work starts, which prunes more candidates
+   *  during the rest pass. Set to 0 to skip the reorder and keep only the
+   *  threshold seed. Ignored when `strategy == none`. */
+  uint32_t warmup_clusters = 1;
   /** When true, the search kernel's blockDim is chosen at runtime based on
    *  device occupancy and total work (3 nested loops: max-blocks-per-SM,
    *  total-threads-cover-device, single-query-fills-SM, plus a Loop D bump

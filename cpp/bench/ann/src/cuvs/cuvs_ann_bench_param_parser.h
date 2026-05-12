@@ -254,6 +254,9 @@ void parse_search_param(const nlohmann::json& conf,
   if (conf.contains("min_sort_pairs")) {
     param.rabitq_param.min_sort_pairs = conf.at("min_sort_pairs");
   }
+  if (conf.contains("warmup_clusters")) {
+    param.rabitq_param.warmup_clusters = conf.at("warmup_clusters");
+  }
   if (conf.contains("ip_variant")) {
     std::string variant = conf.at("ip_variant");
     if (variant == "auto") {

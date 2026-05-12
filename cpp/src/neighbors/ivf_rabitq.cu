@@ -257,7 +257,8 @@ void search(raft::resources const& handle,
                                                params.enable_dynamic_block,
                                                params.min_sort_pairs,
                                                params.ip_variant,
-                                               params.centroid_select);
+                                               params.centroid_select,
+                                               params.warmup_clusters);
   } else if (params.mode == search_mode::QUANT8) {
     idx.rabitq_index().BatchClusterSearchQuantizeQuery(rotated_queries.data_handle(),
                                                        k,
@@ -272,7 +273,8 @@ void search(raft::resources const& handle,
                                                        params.enable_dynamic_block,
                                                        params.min_sort_pairs,
                                                        params.ip_variant,
-                                                       params.centroid_select);
+                                                       params.centroid_select,
+                                                       params.warmup_clusters);
   } else if (params.mode == search_mode::QUANT4) {
     idx.rabitq_index().BatchClusterSearchQuantizeQuery(rotated_queries.data_handle(),
                                                        k,
@@ -287,7 +289,8 @@ void search(raft::resources const& handle,
                                                        params.enable_dynamic_block,
                                                        params.min_sort_pairs,
                                                        params.ip_variant,
-                                                       params.centroid_select);
+                                                       params.centroid_select,
+                                                       params.warmup_clusters);
   }
 
   // cast data in d_final_ids to array of IdxT in neighbors

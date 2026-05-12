@@ -95,7 +95,9 @@ class SearcherGPU {
     float centroid_reorder_scale  = 1.5f,
     const int* d_raft_idx         = nullptr,
     bool enable_dynamic_block     = true,
-    ip_variant_kind ip_variant    = ip_variant_kind::auto_);
+    ip_variant_kind ip_variant    = ip_variant_kind::auto_,
+    uint32_t warmup_clusters      = 1,
+    bool pairs_query_major        = false);
 
   void SearchClusterQueryPairsQuantizeQuery(
     const IVFGPU& cur_ivf,
@@ -114,7 +116,9 @@ class SearcherGPU {
     float centroid_reorder_scale  = 1.5f,
     const int* d_raft_idx         = nullptr,
     bool enable_dynamic_block     = true,
-    ip_variant_kind ip_variant    = ip_variant_kind::auto_);
+    ip_variant_kind ip_variant    = ip_variant_kind::auto_,
+    uint32_t warmup_clusters      = 1,
+    bool pairs_query_major        = false);
 
  private:
   raft::resources const& handle_;  // reusable resource handle

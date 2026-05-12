@@ -297,7 +297,8 @@ class IVFGPU {
     bool enable_dynamic_block          = true,
     uint32_t min_sort_pairs           = 2000,
     ip_variant_kind ip_variant         = ip_variant_kind::auto_,
-    centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
+    centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy,
+    uint32_t warmup_clusters           = 1);
 
   void BatchClusterSearchQuantizeQuery(
     const float* d_query,
@@ -313,7 +314,8 @@ class IVFGPU {
     bool enable_dynamic_block          = true,
     uint32_t min_sort_pairs           = 2000,
     ip_variant_kind ip_variant         = ip_variant_kind::auto_,
-    centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy);
+    centroid_select_kind centroid_sel  = centroid_select_kind::auto_policy,
+    uint32_t warmup_clusters           = 1);
 
  private:
   // d_raft_idx_out exposes raft::matrix::select_k's query-major output so that
@@ -330,6 +332,7 @@ class IVFGPU {
     raft::device_vector<float, int64_t>& d_G_k1xSumq,
     raft::device_vector<float, int64_t>& d_G_kbxSumq,
     raft::device_matrix<int, int64_t>& d_raft_idx_out,
+    bool& pairs_query_major,
     uint32_t min_sort_pairs           = 0,
     centroid_select_kind centroid_sel = centroid_select_kind::auto_policy);
 
