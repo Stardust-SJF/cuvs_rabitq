@@ -237,6 +237,14 @@ class IVFGPU {
   {
     return const_cast<float*>(this->short_factors_batch_.data_handle());
   }
+  __host__ __device__ float* get_representatives_device() const noexcept
+  {
+    return const_cast<float*>(this->representatives_.data_handle());
+  }
+  __host__ bool has_representatives() const noexcept
+  {
+    return this->representatives_.extent(0) > 0;
+  }
   raft::device_vector<GPUClusterMeta, int64_t> const& get_cluster_meta() const
   {
     return cluster_meta_;
@@ -404,6 +412,15 @@ class IVFGPU {
   // batch-data (SoA layout - factors stored separately)
   raft::device_vector<float, int64_t> short_factors_batch_ =
     raft::make_device_vector<float, int64_t>(handle_, 0);  // N * 3 float rabitq factors
+
+  // Per-cluster representative vector in the rotated frame. One D_padded float
+  // vector per cluster — typically the cluster's first member rotated by R.
+  // Used by seed_threshold_from_representative_kernel for a provably-correct
+  // upper bound on the K-th-best distance: max(d(q, rep_i) for top-K nearest
+  // clusters) ≥ true K-th best, regardless of cluster geometry (works on
+  // gist/openai/etc where centroid×scale heuristic fails).
+  raft::device_vector<float, int64_t> representatives_ =
+    raft::make_device_vector<float, int64_t>(handle_, 0);
 
   // host-side copies
   raft::host_vector<uint32_t, int64_t> short_data_host_ = raft::make_host_vector<uint32_t, int64_t>(

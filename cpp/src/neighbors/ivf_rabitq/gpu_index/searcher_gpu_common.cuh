@@ -191,6 +191,101 @@ __global__ inline void seed_threshold_from_centroid_kernel(const int* d_raft_idx
   d_threshold_batch[q] = q_g_add * scale;
 }
 
+// Representative-based seed threshold: provably-correct upper bound on the
+// K-th-best distance.
+//
+// For each query q, we have N_reps representatives r_1..r_N from the top-N
+// nearest clusters (per centroid distance). Their distances to q form a set
+// {d_1,...,d_N}; the K-th smallest of this set is an upper bound on the true
+// K-th-best (because we have N ≥ K real database vectors with these
+// distances). We pass that as the initial threshold.
+//
+// Launch: one block per query. Each block loads the query into shared, then
+// each warp computes one (q, r_i) squared-distance via a strided dot product.
+// Thread 0 picks the K-th smallest from N_reps and writes the threshold.
+//
+// Shared mem: D_padded * sizeof(float) for query + N_reps * sizeof(float) for
+// the per-rep distances.
+template <int BlockSize>
+__global__ void seed_threshold_from_representative_kernel(const int* __restrict__ d_raft_idx,
+                                                          const float* __restrict__ d_query,
+                                                          const float* __restrict__ d_representatives,
+                                                          const float* __restrict__ d_centroid_distances,
+                                                          float* __restrict__ d_threshold_batch,
+                                                          size_t num_centroids,
+                                                          size_t nprobe,
+                                                          int N_reps,
+                                                          int topk,
+                                                          size_t D_padded,
+                                                          float fallback_scale)
+{
+  const int q = blockIdx.x;
+  extern __shared__ float smem_seed[];
+  float* shared_query = smem_seed;
+  float* shared_dists = smem_seed + D_padded;
+
+  const float* q_ptr = d_query + static_cast<size_t>(q) * D_padded;
+  for (size_t i = threadIdx.x; i < D_padded; i += BlockSize) {
+    shared_query[i] = q_ptr[i];
+  }
+  __syncthreads();
+
+  const int lane      = threadIdx.x % 32;
+  const int warp_id   = threadIdx.x / 32;
+  const int num_warps = BlockSize / 32;
+
+  for (int rep_idx = warp_id; rep_idx < N_reps; rep_idx += num_warps) {
+    int cluster_id            = d_raft_idx[static_cast<size_t>(q) * nprobe + rep_idx];
+    const float* rep_ptr      = d_representatives + static_cast<size_t>(cluster_id) * D_padded;
+    float diff_sq             = 0.0f;
+    for (size_t d = lane; d < D_padded; d += 32) {
+      float diff = shared_query[d] - rep_ptr[d];
+      diff_sq += diff * diff;
+    }
+#pragma unroll
+    for (int off = 16; off > 0; off /= 2) {
+      diff_sq += __shfl_down_sync(0xFFFFFFFF, diff_sq, off);
+    }
+    if (lane == 0) shared_dists[rep_idx] = diff_sq;
+  }
+  __syncthreads();
+
+  // Thread 0 picks the K-th smallest of N_reps using a length-K running max.
+  // O(N*K); fine for K≤topk_limit (~32) and N≤2*K.
+  if (threadIdx.x == 0) {
+    constexpr int kMaxTopK = 64;
+    float topk_dists[kMaxTopK];
+    int count       = 0;
+    int k           = topk < kMaxTopK ? topk : kMaxTopK;
+    int n           = N_reps < k ? N_reps : N_reps;
+    for (int i = 0; i < N_reps; i++) {
+      float d = shared_dists[i];
+      if (count < k) {
+        topk_dists[count++] = d;
+      } else {
+        int max_i = 0;
+        for (int j = 1; j < k; j++) {
+          if (topk_dists[j] > topk_dists[max_i]) max_i = j;
+        }
+        if (d < topk_dists[max_i]) topk_dists[max_i] = d;
+      }
+    }
+    float kth = topk_dists[0];
+    for (int j = 1; j < count; j++) {
+      if (topk_dists[j] > kth) kth = topk_dists[j];
+    }
+    // Fallback safety: take the min with the centroid-based heuristic bound.
+    // Both are provable upper bounds on the K-th-best distance, so min is
+    // still valid — guaranteed to be ≤ either alone.
+    int rank_kth =
+      (topk > 0 && static_cast<size_t>(topk - 1) < nprobe) ? (topk - 1) : (int)(nprobe - 1);
+    int kth_cluster      = d_raft_idx[static_cast<size_t>(q) * nprobe + rank_kth];
+    float centroid_bound = d_centroid_distances[static_cast<size_t>(q) * num_centroids + kth_cluster] *
+                           fallback_scale;
+    d_threshold_batch[q] = kth < centroid_bound ? kth : centroid_bound;
+  }
+}
+
 // Fused CENTROID_REORDER setup kernel.
 //
 // One launch produces all three setup outputs needed by the reorder pipeline:

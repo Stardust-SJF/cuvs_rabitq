@@ -242,6 +242,40 @@ void IVFGPU::load_transposed(const char* filename)
   // Initialize cluster metadata (host side) based on the loaded cluster sizes.
   init_clusters(cluster_sizes);
 
+  // Optional trailing block: per-cluster representatives (see save()).
+  // Peek for magic; absence means the index predates this feature and we leave
+  // representatives_ empty (search-side falls back to centroid×scale seed).
+  {
+    const uint32_t kMagic = 0x31525052u;
+    uint32_t magic_in     = 0;
+    auto pos_before       = input.tellg();
+    input.read(reinterpret_cast<char*>(&magic_in), sizeof(magic_in));
+    if (input.good() && magic_in == kMagic) {
+      uint64_t reps_bytes = 0;
+      input.read(reinterpret_cast<char*>(&reps_bytes), sizeof(reps_bytes));
+      const uint64_t expected_bytes =
+        static_cast<uint64_t>(num_centroids) * num_padded_dim * sizeof(float);
+      RAFT_EXPECTS(reps_bytes == expected_bytes,
+                   "Representative block size mismatch: got %llu, expected %llu",
+                   static_cast<unsigned long long>(reps_bytes),
+                   static_cast<unsigned long long>(expected_bytes));
+      representatives_ =
+        raft::make_device_vector<float, int64_t>(handle_, num_centroids * num_padded_dim);
+      auto h_reps = raft::make_host_vector<float, int64_t>(num_centroids * num_padded_dim);
+      input.read(reinterpret_cast<char*>(h_reps.data_handle()),
+                 static_cast<std::streamsize>(reps_bytes));
+      raft::copy(representatives_.data_handle(),
+                 h_reps.data_handle(),
+                 num_centroids * num_padded_dim,
+                 stream_);
+      raft::resource::sync_stream(handle_);
+    } else {
+      // Old index format — rewind so subsequent reads (if any) are unaffected.
+      input.clear();
+      input.seekg(pos_before);
+    }
+  }
+
   input.close();
 }
 
@@ -399,7 +433,145 @@ void IVFGPU::save(const char* filename) const
   write_exact(h_ex_factor_buf.data_handle(), ex_factor_size);
   write_exact(h_ids_buf.data_handle(), ids_size);
 
+  // Optional trailing block: per-cluster representatives.
+  // Magic 'RPR1' (LE) marks the presence of representatives. Old index files
+  // simply end after the ids block and load() will see EOF.
+  if (representatives_.extent(0) > 0) {
+    const uint32_t kMagic       = 0x31525052u;  // 'R','P','R','1' (LE)
+    const uint64_t reps_floats  = num_centroids * num_padded_dim;
+    const uint64_t reps_bytes   = reps_floats * sizeof(float);
+    auto h_reps                 = raft::make_host_vector<float, int64_t>(reps_floats);
+    raft::copy(h_reps.data_handle(), representatives_.data_handle(), reps_floats, stream_);
+    raft::resource::sync_stream(handle_);
+    write_exact(&kMagic, sizeof(kMagic));
+    write_exact(&reps_bytes, sizeof(reps_bytes));
+    write_exact(h_reps.data_handle(), reps_bytes);
+  }
+
   output.close();
+}
+
+/**
+ * @brief Find the medoid PID per cluster.
+ *
+ * Medoid = the cluster member whose distance to the centroid is smallest.
+ * One block per cluster; threads stride over cluster members. Each thread
+ * computes squared distance to centroid for its assigned members and tracks
+ * its own local argmin. Then a block-wide warp-shuffle reduction picks the
+ * cluster's medoid PID.
+ *
+ * Used instead of "first PID" because the medoid gives a much tighter
+ * representative — close to the centroid → close to the cluster's typical
+ * query-distance → tight upper bound when used in seed_threshold.
+ */
+__global__ void find_medoid_pid_kernel(const PID* __restrict__ d_ids,
+                                       const IVFGPU::GPUClusterMeta* __restrict__ d_meta,
+                                       const float* __restrict__ d_data,
+                                       const float* __restrict__ d_centroids,
+                                       size_t num_centroids,
+                                       size_t DIM,
+                                       PID* __restrict__ medoid_pids)
+{
+  const size_t cluster_idx = blockIdx.x;
+  if (cluster_idx >= num_centroids) return;
+
+  IVFGPU::GPUClusterMeta meta = d_meta[cluster_idx];
+  if (meta.num == 0) {
+    if (threadIdx.x == 0) medoid_pids[cluster_idx] = 0;
+    return;
+  }
+
+  const float* centroid = d_centroids + cluster_idx * DIM;
+
+  // Per-thread argmin scan.
+  float local_min_d = INFINITY;
+  PID local_min_p   = d_ids[meta.start_index];
+  for (size_t i = threadIdx.x; i < meta.num; i += blockDim.x) {
+    PID pid          = d_ids[meta.start_index + i];
+    const float* vec = d_data + static_cast<size_t>(pid) * DIM;
+    float dist_sq    = 0.0f;
+    for (size_t d = 0; d < DIM; d++) {
+      float diff = vec[d] - centroid[d];
+      dist_sq += diff * diff;
+    }
+    if (dist_sq < local_min_d) {
+      local_min_d = dist_sq;
+      local_min_p = pid;
+    }
+  }
+
+  // Block-wide argmin reduction via shared memory.
+  __shared__ float s_d[1024];
+  __shared__ PID   s_p[1024];
+  s_d[threadIdx.x] = local_min_d;
+  s_p[threadIdx.x] = local_min_p;
+  __syncthreads();
+
+  for (int stride = blockDim.x / 2; stride > 0; stride /= 2) {
+    if (threadIdx.x < stride) {
+      if (s_d[threadIdx.x + stride] < s_d[threadIdx.x]) {
+        s_d[threadIdx.x] = s_d[threadIdx.x + stride];
+        s_p[threadIdx.x] = s_p[threadIdx.x + stride];
+      }
+    }
+    __syncthreads();
+  }
+  if (threadIdx.x == 0) medoid_pids[cluster_idx] = s_p[0];
+}
+
+/**
+ * @brief Gather a specified PID's vector per cluster from the original dataset,
+ *        padded from DIM to D_padded with zeros.
+ */
+__global__ void gather_pid_padded_kernel(const PID* __restrict__ selected_pids,
+                                         const float* __restrict__ d_data,
+                                         size_t num_centroids,
+                                         size_t DIM,
+                                         size_t D_padded,
+                                         float* __restrict__ gathered_padded)
+{
+  size_t gid   = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t total = num_centroids * D_padded;
+  if (gid >= total) return;
+  size_t cluster_idx = gid / D_padded;
+  size_t col_idx     = gid % D_padded;
+  if (col_idx < DIM) {
+    PID pid              = selected_pids[cluster_idx];
+    gathered_padded[gid] = d_data[static_cast<size_t>(pid) * DIM + col_idx];
+  } else {
+    gathered_padded[gid] = 0.0f;
+  }
+}
+
+/**
+ * @brief Gather each cluster's first PID's vector from the original dataset,
+ *        padded from DIM to D_padded with zeros.
+ *
+ * Used to build the per-cluster representative buffer for seed-threshold:
+ * the first member of each cluster is a real database vector, which gives
+ * a provably correct upper bound on the K-th-best distance (via "K-th smallest
+ * of K representatives" ≥ true K-th best). Padded output is fed to the
+ * rotator to produce representatives in the rotated frame.
+ */
+__global__ void gather_first_pid_padded_kernel(const PID* __restrict__ d_ids,
+                                               const IVFGPU::GPUClusterMeta* __restrict__ d_meta,
+                                               const float* __restrict__ d_data,
+                                               size_t num_centroids,
+                                               size_t DIM,
+                                               size_t D_padded,
+                                               float* __restrict__ gathered_padded)
+{
+  size_t gid   = static_cast<size_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+  size_t total = num_centroids * D_padded;
+  if (gid >= total) return;
+  size_t cluster_idx = gid / D_padded;
+  size_t col_idx     = gid % D_padded;
+  if (col_idx < DIM) {
+    PID first_pid          = d_ids[d_meta[cluster_idx].start_index];
+    gathered_padded[gid]   = d_data[static_cast<size_t>(first_pid) * DIM + col_idx];
+  } else {
+    gathered_padded[gid] = 0.0f;
+  }
 }
 
 /**
@@ -590,6 +762,41 @@ void IVFGPU::construct_on_gpu(const float* device_data,
 
   // Add rotated centroids
   initializer->AddVectors(d_rotated_centroids.data());
+
+  // -------------------------
+  // 11. Populate per-cluster representatives (one rotated vector per cluster,
+  //     used for the seed-threshold tightening). Representative = medoid (the
+  //     cluster member whose distance to the centroid is smallest), giving a
+  //     tight upper-bound on the K-th-best distance in the seed kernel.
+  // -------------------------
+  {
+    representatives_ =
+      raft::make_device_vector<float, int64_t>(handle_, num_centroids * num_padded_dim);
+    rmm::device_uvector<float> gathered(num_centroids * num_padded_dim, stream_);
+    rmm::device_uvector<PID> medoid_pids(num_centroids, stream_);
+    // 11a. Find medoid PID per cluster (1 block of 1024 threads per cluster).
+    find_medoid_pid_kernel<<<static_cast<unsigned>(num_centroids), 1024, 0, stream_>>>(
+      ids_.data_handle(),
+      cluster_meta_.data_handle(),
+      device_data,
+      device_centroids,
+      num_centroids,
+      num_dimensions,
+      medoid_pids.data());
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
+    // 11b. Gather medoid vectors padded to D_padded.
+    {
+      const int block    = 256;
+      const size_t total = num_centroids * num_padded_dim;
+      const int grid     = static_cast<int>((total + block - 1) / block);
+      gather_pid_padded_kernel<<<grid, block, 0, stream_>>>(
+        medoid_pids.data(), device_data, num_centroids, num_dimensions, num_padded_dim,
+        gathered.data());
+      RAFT_CUDA_TRY(cudaPeekAtLastError());
+    }
+    // 11c. Rotate.
+    this->rotator().rotate(gathered.data(), representatives_.data_handle(), num_centroids);
+  }
 
   raft::resource::sync_stream(handle_);
 }

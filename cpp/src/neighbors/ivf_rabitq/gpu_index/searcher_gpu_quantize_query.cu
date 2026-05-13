@@ -1083,10 +1083,16 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
         d_rest_count     = raft::make_device_vector<int, int64_t>(handle_, 1);
         d_reordered_pairs = raft::make_device_vector<ClusterQueryPair, int64_t>(handle_, num_pairs);
 
-        // 1. Fused: seed threshold + build query-major warmup_pairs + flat warmup_per_query.
-        const int fb           = 256;
-        const int total_warmup = static_cast<int>(num_queries * warmup_clusters);
-        const int fg           = (total_warmup + fb - 1) / fb;
+        // 1. Fused: build query-major warmup_pairs + flat warmup_per_query.
+        //    Seed threshold separately below (representative-based when
+        //    available, otherwise the centroid×scale heuristic baked into
+        //    fused_seed_warmup_kernel).
+        // Rep seed needs nprobe >= topk for the K-th-smallest-of-N bound to
+        // be valid (with fewer reps it only bounds the N-th best, not K-th).
+        const bool use_rep_seed = cur_ivf.has_representatives() && nprobe >= topk;
+        const int fb            = 256;
+        const int total_warmup  = static_cast<int>(num_queries * warmup_clusters);
+        const int fg            = (total_warmup + fb - 1) / fb;
         fused_seed_warmup_kernel<<<fg, fb, 0, stream_>>>(d_raft_idx,
                                                           get_centroid_distances(),
                                                           d_warmup_pairs.data_handle(),
@@ -1098,8 +1104,33 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                                                           topk,
                                                           warmup_clusters,
                                                           centroid_reorder_scale,
-                                                          /*emit_seed=*/true);
+                                                          /*emit_seed=*/!use_rep_seed);
         RAFT_CUDA_TRY(cudaPeekAtLastError());
+
+        if (use_rep_seed) {
+          constexpr int kSeedBlock = 256;
+          // Over-fetch: take K-th smallest of 2K representatives (tighter
+          // bound than max of K). Capped at nprobe. The K-th-smallest-of-N
+          // bound requires N >= topk; smaller would only bound the N-th best.
+          const int N_reps =
+            std::min<int>(static_cast<int>(topk) * 2, static_cast<int>(nprobe));
+          const size_t D_padded = cur_ivf.get_num_padded_dim();
+          const size_t smem     = (D_padded + N_reps) * sizeof(float);
+          seed_threshold_from_representative_kernel<kSeedBlock>
+            <<<static_cast<unsigned>(num_queries), kSeedBlock, smem, stream_>>>(
+              d_raft_idx,
+              d_query,
+              cur_ivf.get_representatives_device(),
+              get_centroid_distances(),
+              d_topk_threshold_batch.data_handle(),
+              cur_ivf.get_num_centroids(),
+              nprobe,
+              N_reps,
+              static_cast<int>(topk),
+              D_padded,
+              centroid_reorder_scale);
+          RAFT_CUDA_TRY(cudaPeekAtLastError());
+        }
 
         // 2. Mark non-warmup pairs in d_sorted_pairs (1 byte per pair).
         const int mb = 256;
@@ -1146,17 +1177,41 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
         effective_sorted_pairs = d_reordered_pairs.data_handle();
       } else {
         // Bypass: just seed the threshold (no reorder).
-        const int seed_block = 256;
-        const int seed_grid  = (num_queries + seed_block - 1) / seed_block;
-        seed_threshold_from_centroid_kernel<<<seed_grid, seed_block, 0, stream_>>>(
-          d_raft_idx,
-          get_centroid_distances(),
-          d_topk_threshold_batch.data_handle(),
-          num_queries,
-          cur_ivf.get_num_centroids(),
-          nprobe,
-          topk,
-          centroid_reorder_scale);
+        if (cur_ivf.has_representatives() && nprobe >= topk) {
+          constexpr int kSeedBlock = 256;
+          // Over-fetch: take K-th smallest of 2K representatives (tighter
+          // bound than max of K). Capped at nprobe. The K-th-smallest-of-N
+          // bound requires N >= topk; smaller would only bound the N-th best.
+          const int N_reps =
+            std::min<int>(static_cast<int>(topk) * 2, static_cast<int>(nprobe));
+          const size_t D_padded = cur_ivf.get_num_padded_dim();
+          const size_t smem     = (D_padded + N_reps) * sizeof(float);
+          seed_threshold_from_representative_kernel<kSeedBlock>
+            <<<static_cast<unsigned>(num_queries), kSeedBlock, smem, stream_>>>(
+              d_raft_idx,
+              d_query,
+              cur_ivf.get_representatives_device(),
+              get_centroid_distances(),
+              d_topk_threshold_batch.data_handle(),
+              cur_ivf.get_num_centroids(),
+              nprobe,
+              N_reps,
+              static_cast<int>(topk),
+              D_padded,
+              centroid_reorder_scale);
+        } else {
+          const int seed_block = 256;
+          const int seed_grid  = (num_queries + seed_block - 1) / seed_block;
+          seed_threshold_from_centroid_kernel<<<seed_grid, seed_block, 0, stream_>>>(
+            d_raft_idx,
+            get_centroid_distances(),
+            d_topk_threshold_batch.data_handle(),
+            num_queries,
+            cur_ivf.get_num_centroids(),
+            nprobe,
+            topk,
+            centroid_reorder_scale);
+        }
         RAFT_CUDA_TRY(cudaPeekAtLastError());
       }
     } else {
