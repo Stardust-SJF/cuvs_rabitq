@@ -16,6 +16,7 @@
 #include <raft/core/device_mdspan.hpp>
 #include <raft/core/resources.hpp>
 #include <raft/linalg/detail/cublaslt_wrappers.hpp>
+#include <raft/linalg/gemm.cuh>
 #include <raft/matrix/select_k.cuh>
 
 #include <rmm/device_buffer.hpp>
@@ -1320,27 +1321,26 @@ void IVFGPU::PrepareClusterSearchInputs(
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   } else {
     const float beta = 0.f;
-    // DevicePointerMode = true is intentional. Flipping to false at NQ=1
-    // unlocks the fast `gemv2T_kernel_val` (~5 µs/call vs `_ref` at ~40 µs),
-    // but at NQ≥2 it lengthens cuBLASLt host-side dispatch enough to add
-    // ~12 µs/query end-to-end (gemv kernels are stable+faster, but plumbing
-    // is heavier). The custom kernel above already handles NQ=1, so DPM=true
-    // is the better setting for the NQ≥2 path that lands here.
-    raft::linalg::detail::matmul</* DevicePointerMode = */ true>(
-      handle_,
-      /* trans_a = */ true,
-      /* trans_b = */ false,
-      num_centroids,
-      batch_size,
-      num_padded_dim,
-      &alpha,
-      initializer->GetCentroid(0),
-      num_padded_dim,
-      d_query,
-      num_padded_dim,
-      &beta,
-      searcher_batch->get_centroid_distances(),
-      num_centroids);
+    // Use raft::linalg::gemm (legacy cuBLAS path, same as IVF-PQ's
+    // select_clusters) instead of detail::matmul (cuBLASLt). cuBLASLt's
+    // gemmSN_TN_kernel is bimodal at NQ≥2 (median ~27 µs but 3 ms outliers
+    // from heuristic re-search); legacy cublasSgemm dispatches a stabler
+    // kernel family at the same shape (M=NQ, N=K=4096, K=D=768).
+    raft::linalg::gemm(handle_,
+                       /* trans_a = */ true,
+                       /* trans_b = */ false,
+                       static_cast<int>(num_centroids),
+                       static_cast<int>(batch_size),
+                       static_cast<int>(num_padded_dim),
+                       &alpha,
+                       initializer->GetCentroid(0),
+                       static_cast<int>(num_padded_dim),
+                       d_query,
+                       static_cast<int>(num_padded_dim),
+                       &beta,
+                       searcher_batch->get_centroid_distances(),
+                       static_cast<int>(num_centroids),
+                       stream_);
   }
 
   // Step 2: fused kernel to compute q and c norms
