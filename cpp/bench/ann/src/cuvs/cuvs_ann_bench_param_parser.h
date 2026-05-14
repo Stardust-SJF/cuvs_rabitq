@@ -256,6 +256,12 @@ void parse_search_param(const nlohmann::json& conf,
   }
   if (conf.contains("warmup_clusters")) {
     param.rabitq_param.warmup_clusters = conf.at("warmup_clusters");
+  } else if (conf.contains("n_queries")) {
+    int n_queries = conf.at("n_queries");
+    // Empirically, the reorder warmup overhead is not paid back for single-query
+    // and small batches, while it helps larger batches by tightening thresholds
+    // before the cluster-major pass.
+    param.rabitq_param.warmup_clusters = (n_queries <= 16) ? 0 : 1;
   }
   if (conf.contains("ip_variant")) {
     std::string variant = conf.at("ip_variant");
