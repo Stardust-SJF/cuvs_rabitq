@@ -28,6 +28,15 @@
 
 namespace cuvs::neighbors::ivf_rabitq::detail {
 
+static constexpr bool kEnableSmallBatchQueryByteLut = true;
+
+__device__ __forceinline__ float exact_ip_from_query_byte_lut(uint32_t code_word,
+                                                              const float* __restrict__ lut_word)
+{
+  return lut_word[((code_word >> 24) & 0xffu)] + lut_word[256 + ((code_word >> 16) & 0xffu)] +
+         lut_word[512 + ((code_word >> 8) & 0xffu)] + lut_word[768 + (code_word & 0xffu)];
+}
+
 // Unified kernel template without BlockSort.
 // WithEx=true precomputes warp-level IP2 for all cluster vectors; WithEx=false uses only 1-bit
 // short codes.
@@ -160,7 +169,7 @@ __global__ void computeInnerProductsWithBitwise(const ComputeInnerProductsKernel
 
 // Unified kernel template using BlockSort.
 // NumBits=4 or 8; WithEx=true adds warp-level IP2 refinement with long codes.
-template <int NumBits, bool WithEx>
+template <int NumBits, bool WithEx, bool UseQueryByteLut = false>
 __global__ void computeInnerProductsWithBitwiseBlockSort(
   const ComputeInnerProductsKernelParams params)
 {
@@ -298,6 +307,8 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
         path_a_p2 = true;
       } else if (params.ip_variant == 2) {
         path_a_p2 = false;
+      } else if constexpr (UseQueryByteLut) {
+        path_a_p2 = true;
       } else {
         path_a_p2 = static_cast<int>(num_candidates) >= 2 * num_warps_p2;
       }
@@ -313,12 +324,19 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
               size_t short_code_offset = cluster_start_index * short_code_length +
                                          uint32_idx * num_vectors_in_cluster + vec_idx;
               uint32_t short_code_chunk = params.d_short_data[short_code_offset];
+              if constexpr (UseQueryByteLut) {
+                const float* lut_word =
+                  params.d_lut_for_queries_float +
+                  (static_cast<size_t>(query_idx) * params.num_words + uint32_idx) * 4 * 256;
+                exact_ip += exact_ip_from_query_byte_lut(short_code_chunk, lut_word);
+              } else {
 #pragma unroll 8
-              for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
-                size_t dim = uint32_idx * 32 + bit_idx;
-                if (dim < params.D) {
-                  if ((short_code_chunk >> (31 - bit_idx)) & 0x1) {
-                    exact_ip += shared_query[dim];
+                for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
+                  size_t dim = uint32_idx * 32 + bit_idx;
+                  if (dim < params.D) {
+                    if ((short_code_chunk >> (31 - bit_idx)) & 0x1) {
+                      exact_ip += shared_query[dim];
+                    }
                   }
                 }
               }
@@ -526,11 +544,20 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
             size_t short_code_offset = cluster_start_index * short_code_length +
                                        uint32_idx * num_vectors_in_cluster + vec_idx;
             uint32_t short_code_chunk = params.d_short_data[short_code_offset];
+            if constexpr (UseQueryByteLut) {
+              const float* lut_word =
+                params.d_lut_for_queries_float +
+                (static_cast<size_t>(query_idx) * params.num_words + uint32_idx) * 4 * 256;
+              exact_ip += exact_ip_from_query_byte_lut(short_code_chunk, lut_word);
+            } else {
 #pragma unroll 8
-            for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
-              size_t dim = uint32_idx * 32 + bit_idx;
-              if (dim < params.D) {
-                if ((short_code_chunk >> (31 - bit_idx)) & 0x1) { exact_ip += shared_query[dim]; }
+              for (int bit_idx = 0; bit_idx < 32; bit_idx++) {
+                size_t dim = uint32_idx * 32 + bit_idx;
+                if (dim < params.D) {
+                  if ((short_code_chunk >> (31 - bit_idx)) & 0x1) {
+                    exact_ip += shared_query[dim];
+                  }
+                }
               }
             }
           }
@@ -928,6 +955,34 @@ __global__ void packInt4QueryBitPlanes(const int8_t* __restrict__ queries,
   }
 }
 
+__global__ void buildQueryByteLUT(const float* __restrict__ queries,
+                                  float* __restrict__ query_byte_lut,
+                                  int num_queries,
+                                  int num_words,
+                                  int num_dimensions)
+{
+  const int patterns_per_word = 4 * 256;
+  const int total             = num_queries * num_words * patterns_per_word;
+  for (int idx = blockIdx.x * blockDim.x + threadIdx.x; idx < total;
+       idx += gridDim.x * blockDim.x) {
+    int pattern = idx & 255;
+    int t       = idx >> 8;
+    int byte_id = t & 3;
+    t >>= 2;
+    int word_id  = t % num_words;
+    int query_id = t / num_words;
+
+    const int base_dim = word_id * 32 + byte_id * 8;
+    const float* q     = queries + static_cast<size_t>(query_id) * num_dimensions;
+    float sum          = 0.0f;
+#pragma unroll
+    for (int d = 0; d < 8; ++d) {
+      if ((pattern >> (7 - d)) & 1) { sum += q[base_dim + d]; }
+    }
+    query_byte_lut[idx] = sum;
+  }
+}
+
 // Search with qunatized query vectors
 void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   const IVFGPU& cur_ivf,
@@ -964,7 +1019,11 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   auto d_widths               = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_quantized_queries    = raft::make_device_vector<int8_t, int64_t>(handle_, 0);
   auto d_packed_queries       = raft::make_device_vector<uint32_t, int64_t>(handle_, 0);
+  auto d_query_byte_lut       = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_topk_threshold_batch = raft::make_device_vector<float, int64_t>(handle_, 0);
+  const bool use_query_byte_lut =
+    kEnableSmallBatchQueryByteLut && use_4bit && use_block_sort && rabitq_quantize_flag_ &&
+    num_queries > 1 && num_queries <= 32;
   if (use_block_sort) {
     if (!rabitq_quantize_flag_) {
       d_query_ranges = raft::make_device_vector<float, int64_t>(handle_, num_queries * 2);
@@ -976,6 +1035,10 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     }
     d_packed_queries =
       raft::make_device_vector<uint32_t, int64_t>(handle_, num_queries * num_bits * num_words);
+    if (use_query_byte_lut) {
+      d_query_byte_lut =
+        raft::make_device_vector<float, int64_t>(handle_, num_queries * num_words * 4 * 256);
+    }
     d_topk_threshold_batch = raft::make_device_vector<float, int64_t>(handle_, num_queries);
   }
 
@@ -1048,6 +1111,18 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
         cur_ivf.get_num_padded_dim());
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     }
+  }
+
+  if (use_query_byte_lut) {
+    const int block_size = 256;
+    const int total      = static_cast<int>(num_queries * num_words * 4 * 256);
+    const int grid_size  = (total + block_size - 1) / block_size;
+    buildQueryByteLUT<<<grid_size, block_size, 0, stream_>>>(d_query,
+                                                             d_query_byte_lut.data_handle(),
+                                                             static_cast<int>(num_queries),
+                                                             num_words,
+                                                             cur_ivf.get_num_padded_dim());
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
   }
 
   // We minimize max_cluster_size to reduce shared memory usage when the probe clusters do not
@@ -1297,7 +1372,8 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     // share the same launch bounds, so any of them gives a valid cap.
     cudaFuncAttributes kattrs{};
     RAFT_CUDA_TRY(cudaFuncGetAttributes(
-      &kattrs, reinterpret_cast<const void*>(&computeInnerProductsWithBitwiseBlockSort<4, true>)));
+      &kattrs,
+      reinterpret_cast<const void*>(&computeInnerProductsWithBitwiseBlockSort<4, true, false>)));
     blockDim = compute_dynamic_block_dim(num_queries, num_pairs, dev_props, kattrs.maxThreadsPerBlock);
   }
 
@@ -1322,6 +1398,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   kernelParams.d_short_data            = cur_ivf.get_short_data_device();
   kernelParams.d_cluster_meta          = d_cluster_meta;
   kernelParams.d_packed_queries        = d_packed_queries.data_handle();
+  kernelParams.d_lut_for_queries_float = d_query_byte_lut.data_handle();
   kernelParams.d_widths                = d_widths.data_handle();
   kernelParams.d_short_factors         = cur_ivf.get_short_factors_batch_device();
   kernelParams.d_G_k1xSumq             = d_G_k1xSumq;
@@ -1351,7 +1428,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
 
   if (!use_4bit) {
     if (cur_ivf.get_ex_bits() != 0) {
-      auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<8, true>
+      auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<8, true, false>
                                    : computeInnerProductsWithBitwise<true>;
       auto const& kernel_launcher = [&](auto const& kernel) -> void {
         kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
@@ -1359,7 +1436,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
       cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
         kernel, shared_mem_size, kernel_launcher);
     } else {
-      auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<8, false>
+      auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<8, false, false>
                                    : computeInnerProductsWithBitwise<false>;
       auto const& kernel_launcher = [&](auto const& kernel) -> void {
         kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
@@ -1370,21 +1447,39 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   } else {
     if (cur_ivf.get_ex_bits() != 0) {
-      auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<4, true>
-                                   : computeInnerProductsWithBitwise<true>;
-      auto const& kernel_launcher = [&](auto const& kernel) -> void {
-        kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
-      };
-      cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
-        kernel, shared_mem_size, kernel_launcher);
+      if (use_block_sort && use_query_byte_lut) {
+        auto kernel = computeInnerProductsWithBitwiseBlockSort<4, true, true>;
+        auto const& kernel_launcher = [&](auto const& kernel) -> void {
+          kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+        };
+        cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
+          kernel, shared_mem_size, kernel_launcher);
+      } else {
+        auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<4, true, false>
+                                     : computeInnerProductsWithBitwise<true>;
+        auto const& kernel_launcher = [&](auto const& kernel) -> void {
+          kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+        };
+        cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
+          kernel, shared_mem_size, kernel_launcher);
+      }
     } else {
-      auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<4, false>
-                                   : computeInnerProductsWithBitwise<false>;
-      auto const& kernel_launcher = [&](auto const& kernel) -> void {
-        kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
-      };
-      cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
-        kernel, shared_mem_size, kernel_launcher);
+      if (use_block_sort && use_query_byte_lut) {
+        auto kernel = computeInnerProductsWithBitwiseBlockSort<4, false, true>;
+        auto const& kernel_launcher = [&](auto const& kernel) -> void {
+          kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+        };
+        cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
+          kernel, shared_mem_size, kernel_launcher);
+      } else {
+        auto kernel = use_block_sort ? computeInnerProductsWithBitwiseBlockSort<4, false, false>
+                                     : computeInnerProductsWithBitwise<false>;
+        auto const& kernel_launcher = [&](auto const& kernel) -> void {
+          kernel<<<gridDim, blockDim, shared_mem_size, stream_>>>(kernelParams);
+        };
+        cuvs::neighbors::detail::safely_launch_kernel_with_smem_size(
+          kernel, shared_mem_size, kernel_launcher);
+      }
     }
     RAFT_CUDA_TRY(cudaPeekAtLastError());
   }
