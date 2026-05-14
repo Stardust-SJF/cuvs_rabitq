@@ -279,6 +279,7 @@ class IVFGPU {
   size_t get_num_centroids() const { return num_centroids; }
   size_t get_max_cluster_length() const noexcept { return max_cluster_length; }
   size_t get_ex_bits() const noexcept { return ex_bits; }
+  const float* get_centroid_norms() const noexcept { return centroid_norms_.data_handle(); }
 
   // member object getters
   DataQuantizerGPU& quantizer() const { return *(this->DQ); }
@@ -392,6 +393,8 @@ class IVFGPU {
 
   void AllocateHostMemory();
 
+  void RefreshCentroidNorms();
+
   raft::resources const& handle_;  // reusable resource handle
   rmm::cuda_stream_view stream_ =
     raft::resource::get_cuda_stream(handle_);  // CUDA stream obtained from handle_
@@ -408,6 +411,8 @@ class IVFGPU {
   raft::device_vector<GPUClusterMeta, int64_t> cluster_meta_ =
     raft::make_device_vector<GPUClusterMeta, int64_t>(handle_,
                                                       0);  // Device-side array of clusters.
+  raft::device_vector<float, int64_t> centroid_norms_ =
+    raft::make_device_vector<float, int64_t>(handle_, 0);
 
   // batch-data (SoA layout - factors stored separately)
   raft::device_vector<float, int64_t> short_factors_batch_ =

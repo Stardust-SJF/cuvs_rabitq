@@ -75,6 +75,7 @@ void IVFGPU::AllocateDeviceMemory()
 
   // Allocate memory for the per-cluster metadata and centroids.
   cluster_meta_ = raft::make_device_vector<GPUClusterMeta, int64_t>(handle_, num_centroids);
+  centroid_norms_ = raft::make_device_vector<float, int64_t>(handle_, num_centroids);
   raft::resource::sync_stream(handle_);
 }
 
@@ -138,6 +139,7 @@ void IVFGPU::load_transposed(const char* filename)
   AllocateDeviceMemory();
   // Load initializer data (e.g., centroids) from file.
   this->initializer->LoadCentroids(input, filename);
+  RefreshCentroidNorms();
   // Read raw arrays from file into device memory.
   auto read_into_device = [&](void* d_ptr, size_t n_bytes) {
     std::vector<std::uint8_t> h_buf(n_bytes);  // host staging buffer
@@ -762,6 +764,7 @@ void IVFGPU::construct_on_gpu(const float* device_data,
 
   // Add rotated centroids
   initializer->AddVectors(d_rotated_centroids.data());
+  RefreshCentroidNorms();
 
   // -------------------------
   // 11. Populate per-cluster representatives (one rotated vector per cluster,
@@ -1050,6 +1053,7 @@ void IVFGPU::construct_on_gpu_streaming(const float* host_data,
   // 13. Add rotated centroids
   // -------------------------
   initializer->AddVectors(d_rotated_centroids.data_handle());
+  RefreshCentroidNorms();
 
   raft::resource::sync_stream(handle_);
 }
@@ -1157,6 +1161,7 @@ void IVFGPU::construct(const float* host_data,
 
   // After quantization, add the rotated centroids into the initializer.
   initializer->AddVectors(d_rotated_centroids.data());
+  RefreshCentroidNorms();
 
   raft::resource::sync_stream(handle_);
 }
@@ -1300,6 +1305,27 @@ __global__ void row_norms_fused_kernel(const float* __restrict__ A,
     }
     __syncthreads();  // reuse sdata safely next iteration
   }
+}
+
+void IVFGPU::RefreshCentroidNorms()
+{
+  RAFT_EXPECTS(centroid_norms_.size() == num_centroids,
+               "IVFGPU::RefreshCentroidNorms: centroid_norms_ is not allocated");
+
+  const int norm_block_size = 256;
+  size_t norm_shared_mem    = ((norm_block_size + 31) / 32) * sizeof(float);
+  row_norms_fused_kernel<<<static_cast<int>(num_centroids),
+                           norm_block_size,
+                           norm_shared_mem,
+                           stream_>>>(nullptr,
+                                      0,
+                                      static_cast<int>(num_padded_dim),
+                                      initializer->GetCentroid(0),
+                                      static_cast<int>(num_centroids),
+                                      static_cast<int>(num_padded_dim),
+                                      nullptr,
+                                      centroid_norms_.data_handle());
+  RAFT_CUDA_TRY(cudaPeekAtLastError());
 }
 
 // Add query and centroid norms to dot product matrix
@@ -1550,19 +1576,19 @@ void IVFGPU::PrepareClusterSearchInputs(
                        stream_);
   }
 
-  // Step 2: fused kernel to compute q and c norms
-  int grid                  = num_centroids + batch_size;
+  // Step 2: compute query norms. Centroid norms are fixed index data.
+  int grid                  = batch_size;
   const int norm_block_size = 256;
   size_t norm_shared_mem    = ((norm_block_size + 31) / 32) * sizeof(float);
   row_norms_fused_kernel<<<grid, norm_block_size, norm_shared_mem, stream_>>>(
     d_query,
     batch_size,
     num_padded_dim,
-    initializer->GetCentroid(0),
-    num_centroids,
+    nullptr,
+    0,
     num_padded_dim,
     searcher_batch->get_q_norms(),
-    searcher_batch->get_c_norms());
+    nullptr);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
 
   // Step 3: add all norms together
@@ -1571,7 +1597,7 @@ void IVFGPU::PrepareClusterSearchInputs(
   add_norms_kernel<<<add_blocks, add_threads, 0, stream_>>>(
     searcher_batch->get_centroid_distances(),
     searcher_batch->get_q_norms(),
-    searcher_batch->get_c_norms(),
+    get_centroid_norms(),
     batch_size,
     num_centroids);
   RAFT_CUDA_TRY(cudaPeekAtLastError());
@@ -1663,8 +1689,6 @@ void IVFGPU::PrepareClusterSearchInputs(
                              num_padded_dim,
                              ex_bits,
                              stream_);
-
-  raft::resource::sync_stream(handle_);
 }
 
 void IVFGPU::BatchClusterSearch(const float* d_query,

@@ -57,6 +57,7 @@ struct ComputeInnerProductsKernelParams {
   float* d_topk_dists         = nullptr;  // output top-k distances
   PID* d_topk_pids            = nullptr;  // output top-k PIDs
   int* d_query_write_counters = nullptr;
+  bool pairs_query_major      = false;
   uint32_t num_bits           = 0;  // number of bits (8 for int8)
   uint32_t num_words          = 0;  // approx. D/32
   // Per-block granularity for the candidate-rerank stages. 0=auto (hybrid),

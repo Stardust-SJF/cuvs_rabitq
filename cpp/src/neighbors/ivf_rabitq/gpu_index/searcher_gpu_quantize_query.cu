@@ -259,6 +259,17 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
 
   __syncthreads();
 
+  if (num_candidates == 0 && params.pairs_query_major) {
+    uint32_t output_offset =
+      query_idx * (params.topk * params.nprobe) +
+      (block_id % static_cast<int>(params.nprobe)) * params.topk;
+    for (uint32_t i = tid; i < params.topk; i += num_threads) {
+      params.d_topk_dists[output_offset + i] = INFINITY;
+      params.d_topk_pids[output_offset + i]  = 0;
+    }
+    return;
+  }
+
   if (num_candidates > 0) {
     for (size_t i = tid; i < params.D; i += num_threads) {
       shared_query[i] = params.d_query[query_idx * params.D + i];
@@ -478,7 +489,11 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
         __syncthreads();
 
         queue.done((uint8_t*)shared_mem_raw_2);
-        if (tid == 0) { probe_slot = atomicAdd(&params.d_query_write_counters[query_idx], 1); }
+        if (tid == 0) {
+          probe_slot = params.pairs_query_major
+                         ? (block_id % static_cast<int>(params.nprobe))
+                         : atomicAdd(&params.d_query_write_counters[query_idx], 1);
+        }
         __syncthreads();
 
         if (probe_slot >= params.nprobe) { return; }
@@ -530,7 +545,11 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
       __syncthreads();
 
       queue.done((uint8_t*)shared_mem_raw_2);
-      if (tid == 0) { probe_slot = atomicAdd(&params.d_query_write_counters[query_idx], 1); }
+      if (tid == 0) {
+        probe_slot = params.pairs_query_major
+                       ? (block_id % static_cast<int>(params.nprobe))
+                       : atomicAdd(&params.d_query_write_counters[query_idx], 1);
+      }
       __syncthreads();
 
       uint32_t output_offset = query_idx * (params.topk * params.nprobe) + probe_slot * params.topk;
@@ -598,7 +617,10 @@ __global__ void exrabitq_quantize_query(
   float kConstEpsilon,
   // Outputs
   int8_t* d_long_code,
-  float* d_delta)
+  float* d_delta,
+  uint32_t* d_packed_queries,
+  int num_bits,
+  int num_words)
 {
   //=========================================================================
   // Setup: One block per row
@@ -693,10 +715,35 @@ __global__ void exrabitq_quantize_query(
   //=========================================================================
   // Part C: Pack and Write Long Code (MINIMAL READS, PARALLEL, COALESCED)
   //=========================================================================
-  int long_code_length = D;  // D dims, then D bytes
-  int8_t* out_ptr      = d_long_code + row * long_code_length;
-  for (int j = tid; j < D; j += BlockSize)
-    out_ptr[j] = s_tmp_code[j];  // write outputs directly
+  if (d_long_code != nullptr) {
+    int long_code_length = D;  // D dims, then D bytes
+    int8_t* out_ptr      = d_long_code + row * long_code_length;
+    for (int j = tid; j < D; j += BlockSize) {
+      out_ptr[j] = s_tmp_code[j];  // write outputs directly
+    }
+  }
+
+  if (d_packed_queries != nullptr) {
+    const int dims_per_word = 32;
+    const int total_words   = num_bits * num_words;
+    for (int i = tid; i < total_words; i += BlockSize) {
+      int bit_idx  = i / num_words;
+      int word_idx = i % num_words;
+
+      uint32_t packed_word = 0;
+#pragma unroll 8
+      for (int d = 0; d < dims_per_word; ++d) {
+        int dim_idx = word_idx * dims_per_word + d;
+        if (dim_idx < D) {
+          uint8_t val = static_cast<uint8_t>(s_tmp_code[dim_idx]);
+          if (num_bits == 4) { val &= 0xF; }
+          uint32_t bit_val = (val >> bit_idx) & 1;
+          packed_word |= (bit_val << (31 - d));
+        }
+      }
+      d_packed_queries[row * total_words + i] = packed_word;
+    }
+  }
 }
 
 __global__ void findQueryRanges(const float* __restrict__ queries,
@@ -912,17 +959,21 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   const int num_words = (cur_ivf.get_num_padded_dim() + 31) / 32;
 
   // Allocate memory for quantization
-  auto d_query_write_counters = raft::make_device_vector<int, int64_t>(handle_, num_queries);
+  auto d_query_write_counters = raft::make_device_vector<int, int64_t>(handle_, 0);
   auto d_query_ranges         = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_widths               = raft::make_device_vector<float, int64_t>(handle_, 0);
   auto d_quantized_queries    = raft::make_device_vector<int8_t, int64_t>(handle_, 0);
   auto d_packed_queries       = raft::make_device_vector<uint32_t, int64_t>(handle_, 0);
   auto d_topk_threshold_batch = raft::make_device_vector<float, int64_t>(handle_, 0);
   if (use_block_sort) {
-    d_query_ranges      = raft::make_device_vector<float, int64_t>(handle_, num_queries * 2);
-    d_widths            = raft::make_device_vector<float, int64_t>(handle_, num_queries);
-    d_quantized_queries = raft::make_device_vector<int8_t, int64_t>(
-      handle_, num_queries * cur_ivf.get_num_padded_dim());
+    if (!rabitq_quantize_flag_) {
+      d_query_ranges = raft::make_device_vector<float, int64_t>(handle_, num_queries * 2);
+    }
+    d_widths = raft::make_device_vector<float, int64_t>(handle_, num_queries);
+    if (!rabitq_quantize_flag_) {
+      d_quantized_queries = raft::make_device_vector<int8_t, int64_t>(
+        handle_, num_queries * cur_ivf.get_num_padded_dim());
+    }
     d_packed_queries =
       raft::make_device_vector<uint32_t, int64_t>(handle_, num_queries * num_bits * num_words);
     d_topk_threshold_batch = raft::make_device_vector<float, int64_t>(handle_, num_queries);
@@ -938,10 +989,13 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                                                          num_queries,
                                                          D,
                                                          num_bits,
-                                                         best_rescaling_factor,
-                                                         1.9f,
-                                                         d_quantized_queries.data_handle(),
-                                                         d_widths.data_handle());
+	                                                         best_rescaling_factor,
+	                                                         1.9f,
+	                                                         nullptr,
+	                                                         d_widths.data_handle(),
+	                                                         d_packed_queries.data_handle(),
+	                                                         num_bits,
+	                                                         num_words);
       RAFT_CUDA_TRY(cudaPeekAtLastError());
     } else {  // scalar quantize
       // Step 1: Find min/max for each query
@@ -975,7 +1029,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   }
 
   // Step 3: Pack quantized queries into bit planes
-  if (use_block_sort) {
+  if (use_block_sort && !rabitq_quantize_flag_) {
     const int block_size = 256;
     const int grid_size  = (num_queries * num_bits * num_words + block_size - 1) / block_size;
 
@@ -1011,31 +1065,24 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   std::optional<size_t> max_probed_vectors_count =
     use_block_sort ? std::nullopt : std::optional<size_t>{0};
 
-  // call utility function to evaluate max_cluster_size and max_probed_vectors_count
-  get_max_probed_cluster_size_and_vectors_count(handle_,
-                                                d_sorted_pairs,
-                                                num_queries * nprobe,
-                                                cur_ivf.get_cluster_meta().data_handle(),
-                                                num_queries,
-                                                max_cluster_size,
-                                                max_probed_vectors_count);
+  if (use_block_sort) {
+    max_cluster_size = static_cast<uint32_t>(cur_ivf.get_max_cluster_length());
+  } else {
+    // call utility function to evaluate max_cluster_size and max_probed_vectors_count
+    get_max_probed_cluster_size_and_vectors_count(handle_,
+                                                  d_sorted_pairs,
+                                                  num_queries * nprobe,
+                                                  cur_ivf.get_cluster_meta().data_handle(),
+                                                  num_queries,
+                                                  max_cluster_size,
+                                                  max_probed_vectors_count);
+  }
 
   // allocate memory for intermediate output
   size_t total_elements =
     use_block_sort ? num_queries * nprobe * topk : num_queries * max_probed_vectors_count.value();
   auto d_topk_dists = raft::make_device_vector<float, int64_t>(handle_, total_elements);
   auto d_topk_pids  = raft::make_device_vector<PID, int64_t>(handle_, total_elements);
-
-  // initialize distances
-  thrust::fill(thrust::cuda::par.on(stream_),
-               d_topk_dists.data_handle(),
-               d_topk_dists.data_handle() + total_elements,
-               std::numeric_limits<float>::infinity());
-
-  thrust::fill(thrust::cuda::par.on(stream_),
-               d_query_write_counters.data_handle(),
-               d_query_write_counters.data_handle() + num_queries,
-               0);
 
   // Number of (cluster, query) pairs to process.
   size_t num_pairs = num_queries * nprobe;
@@ -1053,6 +1100,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   // d_sorted_pairs passed to the main kernel — points either at the
   // caller's buffer or at the reordered buffer below.
   const ClusterQueryPair* effective_sorted_pairs = d_sorted_pairs;
+  bool effective_pairs_query_major               = pairs_query_major;
 
   if (use_block_sort) {
     if (strategy == threshold_strategy::centroid_reorder && d_raft_idx != nullptr) {
@@ -1175,6 +1223,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
         RAFT_CUDA_TRY(cudaPeekAtLastError());
 
         effective_sorted_pairs = d_reordered_pairs.data_handle();
+        effective_pairs_query_major = false;
       } else {
         // Bypass: just seed the threshold (no reorder).
         if (cur_ivf.has_representatives() && nprobe >= topk) {
@@ -1221,6 +1270,18 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                    d_topk_threshold_batch.data_handle() + num_queries,
                    std::numeric_limits<float>::infinity());
     }
+  }
+
+  if (!use_block_sort || !effective_pairs_query_major) {
+    thrust::fill(thrust::cuda::par.on(stream_),
+                 d_topk_dists.data_handle(),
+                 d_topk_dists.data_handle() + total_elements,
+                 std::numeric_limits<float>::infinity());
+    d_query_write_counters = raft::make_device_vector<int, int64_t>(handle_, num_queries);
+    thrust::fill(thrust::cuda::par.on(stream_),
+                 d_query_write_counters.data_handle(),
+                 d_query_write_counters.data_handle() + num_queries,
+                 0);
   }
 
   // Launch modified kernel with packed queries instead of LUT
@@ -1283,6 +1344,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   kernelParams.d_topk_dists = d_topk_dists.data_handle();
   kernelParams.d_topk_pids  = d_topk_pids.data_handle();
   kernelParams.d_query_write_counters = d_query_write_counters.data_handle();
+  kernelParams.pairs_query_major      = use_block_sort && effective_pairs_query_major;
   kernelParams.num_bits               = num_bits;
   kernelParams.num_words              = num_words;
   kernelParams.ip_variant             = static_cast<uint8_t>(ip_variant);
@@ -1339,8 +1401,6 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     d_final_pids,
     /*select_min = */ true,
     /* sorted = */ false);
-
-  raft::resource::sync_stream(handle_);
 }
 
 }  // namespace cuvs::neighbors::ivf_rabitq::detail

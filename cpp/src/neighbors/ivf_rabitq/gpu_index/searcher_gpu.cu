@@ -53,16 +53,13 @@ SearcherGPU::SearcherGPU(raft::resources const& handle,
       best_rescaling_factor = fast_quantize_factors->const_scaling_factor_8bit;
     }
   }
-  raft::resource::sync_stream(handle);
 }
 
 void SearcherGPU::AllocateSearcherSpace(size_t num_centroids, size_t num_queries)
 {
   centroid_distances_ =
     raft::make_device_vector<float, int64_t>(handle_, num_queries * num_centroids);
-  c_norms_ = raft::make_device_vector<float, int64_t>(handle_, num_centroids);
   q_norms_ = raft::make_device_vector<float, int64_t>(handle_, num_queries);
-  raft::resource::sync_stream(handle_);
 };
 
 __global__ void precomputeAllLUTs(const float* d_query,      // Query vectors
