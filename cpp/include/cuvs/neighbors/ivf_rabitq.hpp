@@ -187,9 +187,9 @@ struct search_params : cuvs::neighbors::search_params {
   /** Threshold-seeding strategy. See `threshold_strategy`. */
   threshold_strategy strategy = threshold_strategy::centroid_reorder;
   /** Scale factor for the CENTROID_REORDER seed threshold. Production default
-   *  is 1.5 (per upstream sweep across multiple datasets). Ignored when
+   *  is 1.45 (per upstream sweep across multiple datasets). Ignored when
    *  `strategy == none`. */
-  float centroid_reorder_scale = 1.5f;
+  float centroid_reorder_scale = 1.45f;
   /** Number of nearest clusters per query that the CENTROID_REORDER pipeline
    *  promotes to a warmup pass, so they fire before the rest of the pairs
    *  in cluster-major order. The warmup wave tightens each query's topk
