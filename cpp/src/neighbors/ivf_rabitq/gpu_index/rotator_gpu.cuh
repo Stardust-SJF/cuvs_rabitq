@@ -93,7 +93,7 @@ class RotatorGPU {
     raft::make_device_matrix<float, int64_t, raft::row_major>(handle_, 0, 0);
 
   // ---- fht_kac members (used when kind_ == fht_kac) ----
-  size_t trunc_dim_ = 0;  // 1 << floor_log2(dim), largest power-of-2 <= dim
+  size_t trunc_dim_ = 0;  // 1 << floor_log2(D), largest power-of-2 <= padded dimension
   float fac_        = 0;  // 1 / sqrt(trunc_dim)
   int log_N_        = 0;  // log2(trunc_dim), for FHT kernel dispatch
   raft::device_vector<uint8_t, int64_t> flip_bits_ =

@@ -365,6 +365,71 @@ __global__ void fht_kac_rotate_fused_nonpow2_kernel(
         vec_out[i] = smem_data[i] * final_scale;
 }
 
+__global__ void fht_kac_rotate_nonpow2_small_kernel(
+    const float* input,
+    float* output,
+    const uint8_t* __restrict__ flip,
+    int N, int padded_dim, int trunc_dim, float fac, float final_scale)
+{
+    extern __shared__ float smem_data[];
+
+    const int vec_id = blockIdx.x;
+    if (vec_id >= N) return;
+
+    const int start = padded_dim - trunc_dim;
+    const int flip_bytes_per_round = padded_dim / 8;
+    const int half_P = padded_dim / 2;
+
+    const float* vec_in = input + static_cast<size_t>(vec_id) * padded_dim;
+    for (int i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+        smem_data[i] = vec_in[i];
+    }
+    __syncthreads();
+
+    const int offsets[4] = {0, start, 0, start};
+    for (int round = 0; round < 4; ++round) {
+        const uint8_t* round_flip = flip + round * flip_bytes_per_round;
+        for (int i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+            if (round_flip[i / 8] & (1u << (i % 8))) {
+                smem_data[i] = -smem_data[i];
+            }
+        }
+        __syncthreads();
+
+        const int fht_off = offsets[round];
+        for (int stride = 1; stride < trunc_dim; stride <<= 1) {
+            const int half_work = trunc_dim >> 1;
+            for (int j = threadIdx.x; j < half_work; j += blockDim.x) {
+                const int lo   = j & (stride - 1);
+                const int base = (j - lo) * 2 + lo;
+                float a = smem_data[fht_off + base];
+                float b = smem_data[fht_off + base + stride];
+                smem_data[fht_off + base]          = a + b;
+                smem_data[fht_off + base + stride] = a - b;
+            }
+            __syncthreads();
+        }
+
+        for (int i = threadIdx.x; i < trunc_dim; i += blockDim.x) {
+            smem_data[fht_off + i] *= fac;
+        }
+        __syncthreads();
+
+        for (int i = threadIdx.x; i < half_P; i += blockDim.x) {
+            float a = smem_data[i];
+            float b = smem_data[i + half_P];
+            smem_data[i]          = a + b;
+            smem_data[i + half_P] = a - b;
+        }
+        __syncthreads();
+    }
+
+    float* vec_out = output + static_cast<size_t>(vec_id) * padded_dim;
+    for (int i = threadIdx.x; i < padded_dim; i += blockDim.x) {
+        vec_out[i] = smem_data[i] * final_scale;
+    }
+}
+
 // ============================================================================
 // Host-side launch helpers
 // ============================================================================
@@ -388,6 +453,15 @@ inline void launch_fused_rotate_nonpow2(const float* input, float* output,
                                          int padded_dim, float fac,
                                          float final_scale, cudaStream_t stream) {
     using Tr = FhtTraits<kLogTrunc>;
+    if constexpr (kLogTrunc <= 6) {
+        constexpr int block = 256;
+        int smem = padded_dim * static_cast<int>(sizeof(float));
+        RAFT_CUDA_TRY(cudaGetLastError());
+        fht_kac_rotate_nonpow2_small_kernel<<<N, block, smem, stream>>>(
+            input, output, flip, N, padded_dim, Tr::kDim, fac, final_scale);
+        RAFT_CUDA_TRY(cudaGetLastError());
+        return;
+    }
     int smem = padded_dim * (int)sizeof(float)
              + Tr::kNElts * Tr::kNThreads * (int)sizeof(float)
              + 4 * (padded_dim / 8);

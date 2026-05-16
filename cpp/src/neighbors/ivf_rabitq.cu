@@ -17,6 +17,9 @@
 #include <raft/matrix/sample_rows.cuh>
 #include <raft/util/cudart_utils.hpp>
 
+#include <algorithm>
+#include <limits>
+
 namespace cuvs::neighbors::ivf_rabitq {
 
 namespace detail {
@@ -172,6 +175,7 @@ void search(raft::resources const& handle,
             raft::device_matrix_view<float, IdxT, raft::row_major> distances)
 {
   auto stream = raft::resource::get_cuda_stream(handle).value();
+  RAFT_CUDA_TRY(cudaGetLastError());
 
   size_t NQ = queries.extent(0);
   size_t k  = neighbors.extent(1);
@@ -195,9 +199,12 @@ void search(raft::resources const& handle,
 
   auto padded_dim      = idx.rabitq_index().get_num_padded_dim();
   auto rotated_queries = raft::make_device_matrix<T, int64_t>(handle, NQ, padded_dim);
+  RAFT_CUDA_TRY(cudaGetLastError());
   if (padded_dim == dim) {
     // TODO: replace RotatorGPU::rotate with cuVS/RAFT primitives
+    RAFT_CUDA_TRY(cudaGetLastError());
     idx.rabitq_index().rotator().rotate(queries.data_handle(), rotated_queries.data_handle(), NQ);
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
   } else {
     auto padded_queries = raft::make_device_matrix<T, int64_t>(handle, NQ, padded_dim);
     RAFT_CUDA_TRY(
@@ -211,8 +218,10 @@ void search(raft::resources const& handle,
                                     cudaMemcpyDefault,
                                     stream));
     // TODO: replace RotatorGPU::rotate with cuVS/RAFT primitives
+    RAFT_CUDA_TRY(cudaGetLastError());
     idx.rabitq_index().rotator().rotate(
       padded_queries.data_handle(), rotated_queries.data_handle(), NQ);
+    RAFT_CUDA_TRY(cudaPeekAtLastError());
   }
 
   auto search_mode_to_string = [](search_mode mode) -> std::string {
@@ -224,73 +233,89 @@ void search(raft::resources const& handle,
       default: RAFT_FAIL("Invalid search mode");
     }
   };
-  detail::SearcherGPU searcher(handle,
-                               rotated_queries.data_handle(),
-                               padded_dim,
-                               idx.rabitq_index().get_ex_bits(),
-                               search_mode_to_string(params.mode),
-                               idx.rabitq_index().quantizer().get_query_scaling_factor(),
-                               /* rabitq_quantize_flag = */ true);
-  searcher.AllocateSearcherSpace(idx.rabitq_index().get_num_centroids(), NQ);
 
   auto final_ids = raft::make_device_vector<uint32_t, int64_t>(handle, NQ * k);
 
-  if (params.mode == search_mode::LUT32) {
-    idx.rabitq_index().BatchClusterSearch(rotated_queries.data_handle(),
-                                          k,
-                                          params.n_probes,
-                                          &searcher,
-                                          NQ,
-                                          distances.data_handle(),
-                                          final_ids.data_handle());
-  } else if (params.mode == search_mode::LUT16) {
-    // test v3 lut using fp16
-    idx.rabitq_index().BatchClusterSearchLUT16(rotated_queries.data_handle(),
-                                               k,
-                                               params.n_probes,
-                                               &searcher,
-                                               NQ,
-                                               distances.data_handle(),
-                                               final_ids.data_handle(),
-                                               params.strategy,
-                                               params.centroid_reorder_scale,
-                                               params.enable_dynamic_block,
-                                               params.min_sort_pairs,
-                                               params.ip_variant,
-                                               params.centroid_select,
-                                               params.warmup_clusters);
-  } else if (params.mode == search_mode::QUANT8) {
-    idx.rabitq_index().BatchClusterSearchQuantizeQuery(rotated_queries.data_handle(),
-                                                       k,
-                                                       params.n_probes,
-                                                       &searcher,
-                                                       NQ,
-                                                       distances.data_handle(),
-                                                       final_ids.data_handle(),
-                                                       8,
-                                                       params.strategy,
-                                                       params.centroid_reorder_scale,
-                                                       params.enable_dynamic_block,
-                                                       params.min_sort_pairs,
-                                                       params.ip_variant,
-                                                       params.centroid_select,
-                                                       params.warmup_clusters);
-  } else if (params.mode == search_mode::QUANT4) {
-    idx.rabitq_index().BatchClusterSearchQuantizeQuery(rotated_queries.data_handle(),
-                                                       k,
-                                                       params.n_probes,
-                                                       &searcher,
-                                                       NQ,
-                                                       distances.data_handle(),
-                                                       final_ids.data_handle(),
-                                                       4,
-                                                       params.strategy,
-                                                       params.centroid_reorder_scale,
-                                                       params.enable_dynamic_block,
-                                                       params.min_sort_pairs,
-                                                       params.ip_variant,
-                                                       params.centroid_select,
-                                                       params.warmup_clusters);
+  const size_t num_centroids = idx.rabitq_index().get_num_centroids();
+  constexpr size_t kMaxCentroidDistanceBytes = 6ULL << 30;
+  constexpr size_t kMaxCentroidDistanceElemsByInt =
+    static_cast<size_t>(std::numeric_limits<int>::max()) - (64ULL << 20);
+  const size_t max_centroid_distance_elems =
+    std::min(kMaxCentroidDistanceBytes / sizeof(float), kMaxCentroidDistanceElemsByInt);
+  const size_t max_query_chunk_size =
+    num_centroids == 0 ? NQ : std::max<size_t>(1, max_centroid_distance_elems / num_centroids);
+  const size_t num_query_chunks =
+    std::max<size_t>(1, (NQ + max_query_chunk_size - 1) / max_query_chunk_size);
+
+  for (size_t query_chunk = 0; query_chunk < num_query_chunks; ++query_chunk) {
+    const size_t query_offset = (query_chunk * NQ) / num_query_chunks;
+    const size_t query_end    = ((query_chunk + 1) * NQ) / num_query_chunks;
+    const size_t cur_nq       = query_end - query_offset;
+    auto* query_ptr     = rotated_queries.data_handle() + query_offset * padded_dim;
+    auto* dist_ptr      = distances.data_handle() + query_offset * k;
+    auto* id_ptr        = final_ids.data_handle() + query_offset * k;
+
+    detail::SearcherGPU searcher(handle,
+                                 query_ptr,
+                                 padded_dim,
+                                 idx.rabitq_index().get_ex_bits(),
+                                 search_mode_to_string(params.mode),
+                                 idx.rabitq_index().quantizer().get_query_scaling_factor(),
+                                 /* rabitq_quantize_flag = */ true);
+    searcher.AllocateSearcherSpace(num_centroids, cur_nq);
+
+    if (params.mode == search_mode::LUT32) {
+      idx.rabitq_index().BatchClusterSearch(
+        query_ptr, k, params.n_probes, &searcher, cur_nq, dist_ptr, id_ptr);
+    } else if (params.mode == search_mode::LUT16) {
+      // test v3 lut using fp16
+      idx.rabitq_index().BatchClusterSearchLUT16(query_ptr,
+                                                 k,
+                                                 params.n_probes,
+                                                 &searcher,
+                                                 cur_nq,
+                                                 dist_ptr,
+                                                 id_ptr,
+                                                 params.strategy,
+                                                 params.centroid_reorder_scale,
+                                                 params.enable_dynamic_block,
+                                                 params.min_sort_pairs,
+                                                 params.ip_variant,
+                                                 params.centroid_select,
+                                                 params.warmup_clusters);
+    } else if (params.mode == search_mode::QUANT8) {
+      idx.rabitq_index().BatchClusterSearchQuantizeQuery(query_ptr,
+                                                         k,
+                                                         params.n_probes,
+                                                         &searcher,
+                                                         cur_nq,
+                                                         dist_ptr,
+                                                         id_ptr,
+                                                         8,
+                                                         params.strategy,
+                                                         params.centroid_reorder_scale,
+                                                         params.enable_dynamic_block,
+                                                         params.min_sort_pairs,
+                                                         params.ip_variant,
+                                                         params.centroid_select,
+                                                         params.warmup_clusters);
+    } else if (params.mode == search_mode::QUANT4) {
+      idx.rabitq_index().BatchClusterSearchQuantizeQuery(query_ptr,
+                                                         k,
+                                                         params.n_probes,
+                                                         &searcher,
+                                                         cur_nq,
+                                                         dist_ptr,
+                                                         id_ptr,
+                                                         4,
+                                                         params.strategy,
+                                                         params.centroid_reorder_scale,
+                                                         params.enable_dynamic_block,
+                                                         params.min_sort_pairs,
+                                                         params.ip_variant,
+                                                         params.centroid_select,
+                                                         params.warmup_clusters);
+    }
   }
 
   // cast data in d_final_ids to array of IdxT in neighbors

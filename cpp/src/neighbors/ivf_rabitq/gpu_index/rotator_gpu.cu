@@ -62,7 +62,7 @@ void RotatorGPU::init_fht_kac(uint32_t dim)
 {
   D = raft::round_up_safe<uint32_t>(dim, 64u);
 
-  size_t bottom_log = floor_log2_size(dim);
+  size_t bottom_log = floor_log2_size(D);
   trunc_dim_        = 1ULL << bottom_log;
   log_N_            = static_cast<int>(bottom_log);
   fac_              = 1.0f / std::sqrt(static_cast<float>(trunc_dim_));
@@ -125,9 +125,7 @@ void RotatorGPU::load(std::ifstream& input)
     if (kind_ == rotator_kind::matmul) {
       rotation_matrix_ = raft::make_device_matrix<float, int64_t, raft::row_major>(handle_, D, D);
     } else {
-      // Recompute fht_kac derived fields from D. We don't have the original
-      // unpadded dim at load time, but all FHT parameters derive from D
-      // (padded_dim) here since the on-disk flip bits were sized to padded_dim.
+      // Recompute FHT-Kac parameters in the padded vector space used by RaBitQ.
       size_t bottom_log = floor_log2_size(D);
       trunc_dim_        = 1ULL << bottom_log;
       log_N_            = static_cast<int>(bottom_log);
@@ -163,6 +161,7 @@ void RotatorGPU::load(std::ifstream& input)
 // that support input/output aliasing.
 void RotatorGPU::rotate(const float* d_A, float* d_RAND_A, size_t N) const
 {
+  auto stream_view = raft::resource::get_cuda_stream(handle_);
   if (kind_ == rotator_kind::matmul) {
     // cuBLAS assumes column-major. Our matrices are row-major, so we compute
     //   RAND_A^T = P^T * A^T
@@ -175,7 +174,7 @@ void RotatorGPU::rotate(const float* d_A, float* d_RAND_A, size_t N) const
         const_cast<float*>(d_A), D, N),
       raft::make_device_matrix_view<float, int64_t, raft::col_major>(d_RAND_A, D, N));
   } else {
-    cudaStream_t stream = stream_.value();
+    cudaStream_t stream = stream_view.value();
     if (trunc_dim_ == D) {
       // Power-of-2 path: total scale fac^4 deferred to the end.
       float total_scale = fac_ * fac_ * fac_ * fac_;

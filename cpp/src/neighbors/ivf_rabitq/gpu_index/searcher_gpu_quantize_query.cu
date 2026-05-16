@@ -174,16 +174,30 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
   const ComputeInnerProductsKernelParams params)
 {
   const int block_id = blockIdx.x;
-  if (block_id >= params.num_pairs) return;
+  const bool split_large_cluster = params.split_range_size > 0;
+  const int pair_block_id =
+    split_large_cluster ? block_id / static_cast<int>(params.split_max_blocks_per_pair) : block_id;
+  const int split_id =
+    split_large_cluster ? block_id -
+                            pair_block_id * static_cast<int>(params.split_max_blocks_per_pair)
+                        : 0;
+  if (pair_block_id >= params.num_pairs) return;
 
-  ClusterQueryPair pair = params.d_sorted_pairs[block_id];
+  ClusterQueryPair pair = params.d_sorted_pairs[pair_block_id];
   int cluster_idx       = pair.cluster_idx;
   int query_idx         = pair.query_idx;
 
   if (cluster_idx >= params.num_centroids || query_idx >= params.num_queries) return;
 
-  size_t num_vectors_in_cluster = params.d_cluster_meta[cluster_idx].num;
-  size_t cluster_start_index    = params.d_cluster_meta[cluster_idx].start_index;
+  const size_t cluster_size        = params.d_cluster_meta[cluster_idx].num;
+  const size_t cluster_start_index = params.d_cluster_meta[cluster_idx].start_index;
+  const size_t range_start =
+    split_large_cluster ? static_cast<size_t>(split_id) * params.split_range_size : 0;
+  if (range_start >= cluster_size) return;
+  const size_t range_len =
+    split_large_cluster
+      ? min(static_cast<size_t>(params.split_range_size), cluster_size - range_start)
+      : cluster_size;
 
   extern __shared__ __align__(256) char shared_mem_raw_2[];
   uint32_t* shared_packed_query = reinterpret_cast<uint32_t*>(shared_mem_raw_2);
@@ -217,13 +231,14 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
   const size_t short_code_length = params.D / 32;
 
   // Phase 1: Bitwise inner product filter
-  for (size_t vec_base = 0; vec_base < num_vectors_in_cluster; vec_base += num_threads) {
-    size_t vec_idx = vec_base + tid;
+  for (size_t vec_base = 0; vec_base < range_len; vec_base += num_threads) {
+    size_t range_vec_idx = vec_base + tid;
+    size_t vec_idx       = range_start + range_vec_idx;
 
     bool is_candidate        = false;
     float local_ip_quantized = 0;
 
-    if (vec_idx < num_vectors_in_cluster) {
+    if (range_vec_idx < range_len) {
       size_t factor_offset = cluster_start_index + vec_idx;
       float3 factors       = reinterpret_cast<const float3*>(params.d_short_factors)[factor_offset];
       float f_add          = factors.x;
@@ -232,8 +247,7 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
 
       int32_t accumulator = 0;
       for (int word = 0; word < params.num_words; ++word) {
-        size_t data_offset =
-          cluster_start_index * params.num_words + word * num_vectors_in_cluster + vec_idx;
+        size_t data_offset = cluster_start_index * params.num_words + word * cluster_size + vec_idx;
         uint32_t data_word = params.d_short_data[data_offset];
 
 #pragma unroll
@@ -261,17 +275,20 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
       int candidate_slot = atomicAdd(&num_candidates, 1);
       if (candidate_slot < params.max_candidates_per_pair) {
         shared_candidate_ips[candidate_slot]     = local_ip_quantized;
-        shared_candidate_indices[candidate_slot] = vec_idx;
+        shared_candidate_indices[candidate_slot] = static_cast<int>(vec_idx);
       }
     }
   }
 
   __syncthreads();
 
-  if (num_candidates == 0 && params.pairs_query_major) {
+  const int candidate_count =
+    min(num_candidates, static_cast<int>(params.max_candidates_per_pair));
+
+  if (candidate_count == 0 && params.pairs_query_major) {
     uint32_t output_offset =
-      query_idx * (params.topk * params.nprobe) +
-      (block_id % static_cast<int>(params.nprobe)) * params.topk;
+      query_idx * (params.topk * params.output_slots_per_query) +
+      (pair_block_id % static_cast<int>(params.nprobe)) * params.topk;
     for (uint32_t i = tid; i < params.topk; i += num_threads) {
       params.d_topk_dists[output_offset + i] = INFINITY;
       params.d_topk_pids[output_offset + i]  = 0;
@@ -279,13 +296,13 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
     return;
   }
 
-  if (num_candidates > 0) {
+  if (candidate_count > 0) {
     for (size_t i = tid; i < params.D; i += num_threads) {
       shared_query[i] = params.d_query[query_idx * params.D + i];
     }
     __syncthreads();
 
-    const int candidates_per_thread = (num_candidates + num_threads - 1) / num_threads;
+    const int candidates_per_thread = (candidate_count + num_threads - 1) / num_threads;
     __shared__ int probe_slot;
 
     if constexpr (WithEx) {
@@ -310,19 +327,19 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
       } else if constexpr (UseQueryByteLut) {
         path_a_p2 = true;
       } else {
-        path_a_p2 = static_cast<int>(num_candidates) >= 2 * num_warps_p2;
+        path_a_p2 = candidate_count >= 2 * num_warps_p2;
       }
       if (path_a_p2) {
         // ----- Path A: thread-per-candidate -----
         for (int c = 0; c < candidates_per_thread; ++c) {
           int cand_idx = tid + c * num_threads;
-          if (cand_idx < num_candidates) {
+          if (cand_idx < candidate_count) {
             int vec_idx    = shared_candidate_indices[cand_idx];
             float exact_ip = 0.0f;
 
             for (size_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
-              size_t short_code_offset = cluster_start_index * short_code_length +
-                                         uint32_idx * num_vectors_in_cluster + vec_idx;
+              size_t short_code_offset =
+                cluster_start_index * short_code_length + uint32_idx * cluster_size + vec_idx;
               uint32_t short_code_chunk = params.d_short_data[short_code_offset];
               if constexpr (UseQueryByteLut) {
                 const float* lut_word =
@@ -361,13 +378,13 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
         // load is also a broadcast (1 wavefront) instead of 32 strided loads.
         const int wid = tid / raft::WarpSize;
         const int lid = tid % raft::WarpSize;
-        for (int cand_idx = wid; cand_idx < static_cast<int>(num_candidates);
+        for (int cand_idx = wid; cand_idx < candidate_count;
              cand_idx += num_warps_p2) {
           int vec_idx    = shared_candidate_indices[cand_idx];
           float exact_ip = 0.0f;
           for (size_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
-            size_t short_code_offset = cluster_start_index * short_code_length +
-                                       uint32_idx * num_vectors_in_cluster + vec_idx;
+            size_t short_code_offset =
+              cluster_start_index * short_code_length + uint32_idx * cluster_size + vec_idx;
             uint32_t short_code_chunk = params.d_short_data[short_code_offset];
             size_t dim = uint32_idx * 32 + lid;
             if (dim < params.D) {
@@ -413,10 +430,10 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
         } else {
           // auto and forced warp_per_cand both require ncand < num_warps for
           // Path B to be correct.
-          path_a_ip2 = static_cast<int>(num_candidates) >= num_warps;
+          path_a_ip2 = candidate_count >= num_warps;
         }
         if (path_a_ip2) {
-          for (int cand_idx = warp_id; cand_idx < num_candidates; cand_idx += num_warps) {
+          for (int cand_idx = warp_id; cand_idx < candidate_count; cand_idx += num_warps) {
             size_t global_vec_idx = cluster_start_index + shared_candidate_indices[cand_idx];
             const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
 
@@ -438,12 +455,11 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
           // Sized to 64 — covers num_warps up to 64 (max blockDim 2048 here is bounded
           // well below that).
           __shared__ float s_ip2_partial[64];
-          const int warps_per_cand =
-            num_warps / max(1, static_cast<int>(num_candidates));
+          const int warps_per_cand = num_warps / max(1, candidate_count);
           const int my_cand    = warp_id / max(1, warps_per_cand);
           const int my_subwarp = warp_id % max(1, warps_per_cand);
 
-          if (my_cand < static_cast<int>(num_candidates)) {
+          if (my_cand < candidate_count) {
             size_t global_vec_idx = cluster_start_index + shared_candidate_indices[my_cand];
             const uint8_t* vec_long_code = params.d_long_code + global_vec_idx * long_code_size;
             const int dim_per_subwarp =
@@ -468,7 +484,7 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
           }
           __syncthreads();
           // Cross-warp reduce per cand: lane 0 of warp `cand` sums up warps_per_cand floats.
-          if (warp_id < static_cast<int>(num_candidates) && lane_id == 0) {
+          if (warp_id < candidate_count && lane_id == 0) {
             float total = 0.0f;
 #pragma unroll 8
             for (int i = 0; i < warps_per_cand; ++i) {
@@ -484,7 +500,7 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
 
           float ex_dist;
           uint32_t pid;
-          if (cand_idx < num_candidates) {
+          if (cand_idx < candidate_count) {
             float ip              = shared_candidate_ips[cand_idx];
             float ip2             = shared_ip2_results[cand_idx];
             int local_vec_idx     = shared_candidate_indices[cand_idx];
@@ -509,15 +525,15 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
         queue.done((uint8_t*)shared_mem_raw_2);
         if (tid == 0) {
           probe_slot = params.pairs_query_major
-                         ? (block_id % static_cast<int>(params.nprobe))
+                         ? (pair_block_id % static_cast<int>(params.nprobe))
                          : atomicAdd(&params.d_query_write_counters[query_idx], 1);
         }
         __syncthreads();
 
-        if (probe_slot >= params.nprobe) { return; }
+        if (probe_slot >= params.output_slots_per_query) { return; }
 
         uint32_t output_offset =
-          query_idx * (params.topk * params.nprobe) + probe_slot * params.topk;
+          query_idx * (params.topk * params.output_slots_per_query) + probe_slot * params.topk;
         queue.store(params.d_topk_dists + output_offset,
                     (uint32_t*)(params.d_topk_pids + output_offset));
       }
@@ -531,7 +547,7 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
       PID final_pid;
       for (int c = 0; c < candidates_per_thread; ++c) {
         int cand_idx = tid + c * num_threads;
-        if (cand_idx < num_candidates) {
+        if (cand_idx < candidate_count) {
           int vec_idx          = shared_candidate_indices[cand_idx];
           size_t factor_offset = cluster_start_index + vec_idx;
           float3 factors  = reinterpret_cast<const float3*>(params.d_short_factors)[factor_offset];
@@ -541,8 +557,8 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
 
           float exact_ip = 0.0f;
           for (size_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
-            size_t short_code_offset = cluster_start_index * short_code_length +
-                                       uint32_idx * num_vectors_in_cluster + vec_idx;
+            size_t short_code_offset =
+              cluster_start_index * short_code_length + uint32_idx * cluster_size + vec_idx;
             uint32_t short_code_chunk = params.d_short_data[short_code_offset];
             if constexpr (UseQueryByteLut) {
               const float* lut_word =
@@ -574,24 +590,27 @@ __global__ void computeInnerProductsWithBitwiseBlockSort(
       queue.done((uint8_t*)shared_mem_raw_2);
       if (tid == 0) {
         probe_slot = params.pairs_query_major
-                       ? (block_id % static_cast<int>(params.nprobe))
+                       ? (pair_block_id % static_cast<int>(params.nprobe))
                        : atomicAdd(&params.d_query_write_counters[query_idx], 1);
       }
       __syncthreads();
 
-      uint32_t output_offset = query_idx * (params.topk * params.nprobe) + probe_slot * params.topk;
+      if (probe_slot >= params.output_slots_per_query) { return; }
+
+      uint32_t output_offset =
+        query_idx * (params.topk * params.output_slots_per_query) + probe_slot * params.topk;
       queue.store(params.d_topk_dists + output_offset,
                   (uint32_t*)(params.d_topk_pids + output_offset));
     }
 
     // Update threshold atomically
-    if (num_candidates >= params.topk) {
+    if (candidate_count >= params.topk) {
       float max_topk_dist;
 
       if (tid == 0) {
         max_topk_dist = -INFINITY;
         uint32_t output_offset =
-          query_idx * (params.topk * params.nprobe) + probe_slot * params.topk;
+          query_idx * (params.topk * params.output_slots_per_query) + probe_slot * params.topk;
         for (uint32_t i = 0; i < params.topk; i++) {
           float dist = params.d_topk_dists[output_offset + i];
           if (dist > 0 && dist > max_topk_dist && dist < INFINITY) { max_topk_dist = dist; }
@@ -1008,6 +1027,10 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   // check if the inner products kernel should use block sort to keep a top-k priority queue vs.
   // outputting distances from all vectors in probed clusters
   const bool use_block_sort{topk <= kMaxTopKBlockSort};
+  RAFT_EXPECTS(num_queries <= std::numeric_limits<uint32_t>::max() &&
+                 nprobe <= std::numeric_limits<uint32_t>::max() &&
+                 topk <= std::numeric_limits<uint32_t>::max(),
+               "RaBitQ GPU search kernel supports num_queries, nprobe, and topk up to uint32_t");
 
   // query quantize
   const int num_bits  = use_4bit ? 4 : 8;  // Choose bit width
@@ -1140,27 +1163,24 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   std::optional<size_t> max_probed_vectors_count =
     use_block_sort ? std::nullopt : std::optional<size_t>{0};
 
-  if (use_block_sort) {
-    max_cluster_size = static_cast<uint32_t>(cur_ivf.get_max_cluster_length());
-  } else {
-    // call utility function to evaluate max_cluster_size and max_probed_vectors_count
-    get_max_probed_cluster_size_and_vectors_count(handle_,
-                                                  d_sorted_pairs,
-                                                  num_queries * nprobe,
-                                                  cur_ivf.get_cluster_meta().data_handle(),
-                                                  num_queries,
-                                                  max_cluster_size,
-                                                  max_probed_vectors_count);
-  }
+  // Evaluate the maximum cluster size only over the clusters probed by this
+  // search call. The global index maximum can be too conservative for large,
+  // imbalanced datasets and can exceed per-block dynamic shared memory limits.
+  get_max_probed_cluster_size_and_vectors_count(handle_,
+                                                d_sorted_pairs,
+                                                num_queries * nprobe,
+                                                cur_ivf.get_cluster_meta().data_handle(),
+                                                num_queries,
+                                                max_cluster_size,
+                                                max_probed_vectors_count);
 
-  // allocate memory for intermediate output
-  size_t total_elements =
-    use_block_sort ? num_queries * nprobe * topk : num_queries * max_probed_vectors_count.value();
-  auto d_topk_dists = raft::make_device_vector<float, int64_t>(handle_, total_elements);
-  auto d_topk_pids  = raft::make_device_vector<PID, int64_t>(handle_, total_elements);
+  auto d_topk_dists = raft::make_device_vector<float, int64_t>(handle_, 0);
+  auto d_topk_pids  = raft::make_device_vector<PID, int64_t>(handle_, 0);
 
   // Number of (cluster, query) pairs to process.
   size_t num_pairs = num_queries * nprobe;
+  RAFT_EXPECTS(num_pairs <= std::numeric_limits<uint32_t>::max(),
+               "RaBitQ GPU search kernel grid exceeds uint32_t range");
 
   // CENTROID_REORDER pipeline workspace. Allocated only when the reorder
   // path fires; otherwise these stay zero-sized.
@@ -1347,26 +1367,14 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     }
   }
 
-  if (!use_block_sort || !effective_pairs_query_major) {
-    thrust::fill(thrust::cuda::par.on(stream_),
-                 d_topk_dists.data_handle(),
-                 d_topk_dists.data_handle() + total_elements,
-                 std::numeric_limits<float>::infinity());
-    d_query_write_counters = raft::make_device_vector<int, int64_t>(handle_, num_queries);
-    thrust::fill(thrust::cuda::par.on(stream_),
-                 d_query_write_counters.data_handle(),
-                 d_query_write_counters.data_handle() + num_queries,
-                 0);
-  }
-
   // Launch modified kernel with packed queries instead of LUT
   uint32_t gridDim{static_cast<uint32_t>(num_pairs)};
   uint32_t blockDim{256};
+  cudaDeviceProp dev_props{};
+  int dev_id = 0;
+  RAFT_CUDA_TRY(cudaGetDevice(&dev_id));
+  RAFT_CUDA_TRY(cudaGetDeviceProperties(&dev_props, dev_id));
   if (enable_dynamic_block) {
-    cudaDeviceProp dev_props{};
-    int dev_id = 0;
-    RAFT_CUDA_TRY(cudaGetDevice(&dev_id));
-    RAFT_CUDA_TRY(cudaGetDeviceProperties(&dev_props, dev_id));
     // Use a representative kernel for the maxThreadsPerBlock attribute. The
     // four BitwiseBlockSort variants (NumBits ∈ {4,8} × WithEx ∈ {0,1}) all
     // share the same launch bounds, so any of them gives a valid cap.
@@ -1384,11 +1392,97 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
                        blockDim / raft::WarpSize, kMaxTopKBlockSort)
                    : 0;
 
+  uint32_t max_candidates_per_pair = max_cluster_size;
+  size_t max_dynamic_smem          = dev_props.sharedMemPerBlockOptin > 0
+                                       ? dev_props.sharedMemPerBlockOptin
+                                       : dev_props.sharedMemPerBlock;
+  if (max_dynamic_smem > 4096) { max_dynamic_smem -= 4096; }
+  // When the dynamic block heuristic has already chosen the 256-thread floor,
+  // split large clusters only enough to keep at least four such blocks resident
+  // by shared-memory budget. This preserves the no-split path for ordinary
+  // clusters and avoids candidate truncation.
+  size_t four_block_smem_target = max_dynamic_smem;
+  if (dev_props.sharedMemPerMultiprocessor > 0) {
+    size_t per_sm_four_block_budget = dev_props.sharedMemPerMultiprocessor / 4;
+    if (per_sm_four_block_budget > 4096) { per_sm_four_block_budget -= 4096; }
+    four_block_smem_target = min(four_block_smem_target, per_sm_four_block_budget);
+  }
+  auto smem_for_capacity = [&](uint32_t candidate_capacity) {
+    size_t packed_query_size =
+      max((use_block_sort ? (num_bits * num_words * sizeof(uint32_t)) : 0),
+          candidate_capacity * sizeof(float));
+    size_t candidate_storage =
+      use_block_sort ? candidate_capacity * (sizeof(float) + sizeof(int)) : 0;
+    return max(packed_query_size + candidate_storage + query_storage,
+               static_cast<size_t>(queue_buffer_smem_bytes));
+  };
+  auto find_largest_capacity = [&](uint32_t min_capacity, uint32_t max_capacity, size_t smem_limit) {
+    uint32_t lo = min_capacity;
+    uint32_t hi = max_capacity;
+    while (lo < hi) {
+      uint32_t mid = lo + (hi - lo + 1) / 2;
+      if (smem_for_capacity(mid) <= smem_limit) {
+        lo = mid;
+      } else {
+        hi = mid - 1;
+      }
+    }
+    return lo;
+  };
+
+  uint32_t split_range_size          = 0;
+  uint32_t split_max_blocks_per_pair = 1;
+  if (use_block_sort && enable_dynamic_block && blockDim == kSearchKernelMinBlockDim &&
+      four_block_smem_target > 0) {
+    if (smem_for_capacity(max_cluster_size) > four_block_smem_target) {
+      uint32_t lo = static_cast<uint32_t>(topk);
+      uint32_t hi = max_cluster_size;
+      if (lo > hi) { lo = hi; }
+      if (smem_for_capacity(lo) <= four_block_smem_target) {
+        lo = find_largest_capacity(lo, hi, four_block_smem_target);
+        if (lo > 0 && lo < max_cluster_size) {
+          split_range_size          = lo;
+          split_max_blocks_per_pair = (max_cluster_size + split_range_size - 1) / split_range_size;
+          max_candidates_per_pair   = split_range_size;
+          size_t split_grid_dim     = num_pairs * split_max_blocks_per_pair;
+          RAFT_EXPECTS(split_grid_dim <= std::numeric_limits<uint32_t>::max(),
+                       "RaBitQ split search kernel grid exceeds uint32_t range");
+          gridDim = static_cast<uint32_t>(split_grid_dim);
+        }
+      }
+    }
+  }
+
+  const size_t output_slots_per_query =
+    use_block_sort ? nprobe * split_max_blocks_per_pair : max_probed_vectors_count.value();
+  RAFT_EXPECTS(output_slots_per_query <= std::numeric_limits<uint32_t>::max(),
+               "RaBitQ search output slots per query exceed uint32_t range");
+  const size_t total_elements =
+    use_block_sort ? num_queries * output_slots_per_query * topk
+                   : num_queries * output_slots_per_query;
+  d_topk_dists = raft::make_device_vector<float, int64_t>(handle_, total_elements);
+  d_topk_pids  = raft::make_device_vector<PID, int64_t>(handle_, total_elements);
+
+  const bool kernel_pairs_query_major =
+    use_block_sort && effective_pairs_query_major && split_range_size == 0;
+  if (!use_block_sort || !kernel_pairs_query_major) {
+    thrust::fill(thrust::cuda::par.on(stream_),
+                 d_topk_dists.data_handle(),
+                 d_topk_dists.data_handle() + total_elements,
+                 std::numeric_limits<float>::infinity());
+    d_query_write_counters = raft::make_device_vector<int, int64_t>(handle_, num_queries);
+    thrust::fill(thrust::cuda::par.on(stream_),
+                 d_query_write_counters.data_handle(),
+                 d_query_write_counters.data_handle() + num_queries,
+                 0);
+  }
+
   // Now we need: packed query bits, candidate storage, and query vector
   // this part is also used to store ip2 results
   size_t packed_query_size = max((use_block_sort ? (num_bits * num_words * sizeof(uint32_t)) : 0),
-                                 max_cluster_size * sizeof(float));
-  size_t candidate_storage = use_block_sort ? max_cluster_size * (sizeof(float) + sizeof(int)) : 0;
+                                 max_candidates_per_pair * sizeof(float));
+  size_t candidate_storage =
+    use_block_sort ? max_candidates_per_pair * (sizeof(float) + sizeof(int)) : 0;
   size_t shared_mem_size =
     max(packed_query_size + candidate_storage + query_storage, (size_t)queue_buffer_smem_bytes);
 
@@ -1411,7 +1505,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   kernelParams.num_centroids           = cur_ivf.get_num_centroids();
   kernelParams.D                       = D;
   kernelParams.d_threshold             = d_topk_threshold_batch.data_handle();
-  kernelParams.max_candidates_per_pair = max_cluster_size;
+  kernelParams.max_candidates_per_pair = max_candidates_per_pair;
   kernelParams.max_candidates_per_query =
     use_block_sort ? 0 /* unused */ : max_probed_vectors_count.value();
   kernelParams.ex_bits      = cur_ivf.get_ex_bits();
@@ -1421,9 +1515,12 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
   kernelParams.d_topk_dists = d_topk_dists.data_handle();
   kernelParams.d_topk_pids  = d_topk_pids.data_handle();
   kernelParams.d_query_write_counters = d_query_write_counters.data_handle();
-  kernelParams.pairs_query_major      = use_block_sort && effective_pairs_query_major;
+  kernelParams.pairs_query_major      = kernel_pairs_query_major;
   kernelParams.num_bits               = num_bits;
   kernelParams.num_words              = num_words;
+  kernelParams.output_slots_per_query = static_cast<uint32_t>(output_slots_per_query);
+  kernelParams.split_range_size       = split_range_size;
+  kernelParams.split_max_blocks_per_pair = split_max_blocks_per_pair;
   kernelParams.ip_variant             = static_cast<uint8_t>(ip_variant);
 
   if (!use_4bit) {
@@ -1490,7 +1587,7 @@ void SearcherGPU::SearchClusterQueryPairsQuantizeQuery(
     d_topk_dists.data_handle(),
     d_topk_pids.data_handle(),
     num_queries,
-    use_block_sort ? (nprobe * topk) : max_probed_vectors_count.value(),
+    use_block_sort ? (output_slots_per_query * topk) : max_probed_vectors_count.value(),
     topk,
     d_final_dists,
     d_final_pids,
