@@ -51,7 +51,7 @@ RotatorGPU::RotatorGPU(raft::resources const& handle, uint32_t dim, rotator_kind
 
 void RotatorGPU::init_matmul(uint32_t dim)
 {
-  D                = raft::round_up_safe<uint32_t>(dim, 64u);
+  D                = raft::round_up_safe<uint32_t>(dim, 32u);
   rotation_matrix_ = raft::make_device_matrix<float, int64_t, raft::row_major>(handle_, D, D);
   raft::random::RngState rng(7ULL);
   raft::random::normal(handle_, rng, rotation_matrix_.data_handle(), D * D, 0.0f, 1.0f);
@@ -60,7 +60,7 @@ void RotatorGPU::init_matmul(uint32_t dim)
 
 void RotatorGPU::init_fht_kac(uint32_t dim)
 {
-  D = raft::round_up_safe<uint32_t>(dim, 64u);
+  D = raft::round_up_safe<uint32_t>(dim, 32u);
 
   size_t bottom_log = floor_log2_size(D);
   trunc_dim_        = 1ULL << bottom_log;

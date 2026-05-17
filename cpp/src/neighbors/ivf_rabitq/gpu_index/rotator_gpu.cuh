@@ -35,7 +35,7 @@ class RotatorGPU {
    * @brief Construct a new RotatorGPU.
    * @param handle  raft resources handle.
    * @param dim     Original (unpadded) vector dimension. Padded dimension D is
-   *                round_up_to_multiple_of(dim, 64).
+   *                round_up_to_multiple_of(dim, 32).
    * @param kind    Rotator implementation to use.
    */
   explicit RotatorGPU(raft::resources const& handle,

@@ -454,7 +454,7 @@ inline void launch_fused_rotate_nonpow2(const float* input, float* output,
                                          float final_scale, cudaStream_t stream) {
     using Tr = FhtTraits<kLogTrunc>;
     if constexpr (kLogTrunc <= 6) {
-        constexpr int block = 256;
+        constexpr int block = 32;
         int smem = padded_dim * static_cast<int>(sizeof(float));
         RAFT_CUDA_TRY(cudaGetLastError());
         fht_kac_rotate_nonpow2_small_kernel<<<N, block, smem, stream>>>(

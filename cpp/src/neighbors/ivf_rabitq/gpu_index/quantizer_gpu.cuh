@@ -49,7 +49,7 @@ class DataQuantizerGPU {
   // Constructor: initialize from dimension and bit count.
   explicit DataQuantizerGPU(raft::resources const& handle, size_t dim, size_t b)
     : DIM(dim),
-      D(raft::round_up_safe<size_t>(dim, 64)),
+      D(raft::round_up_safe<size_t>(dim, 32)),
       EX_BITS(b),
       SHORT_CODE_LENGTH((D + 31) / 32),
       LONG_CODE_LENGTH(D * EX_BITS / 8)  // Simplified for now.
@@ -189,7 +189,7 @@ class DataQuantizerGPU {
  private:
   // Dimension and quantization parameters
   size_t DIM;                // Original data dimension.
-  size_t D;                  // Padded dimension (multiple of 64).
+  size_t D;                  // Padded dimension (multiple of 32).
   size_t EX_BITS;            // Number of bits for ExRaBitQ.
   size_t SHORT_CODE_LENGTH;  // Number of uint32_t to store 1-bit code for a vector.
   size_t LONG_CODE_LENGTH;   // Number of uint8_t to store EX_BITS code for a vector.
