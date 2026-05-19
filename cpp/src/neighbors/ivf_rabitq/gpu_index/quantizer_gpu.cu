@@ -1039,7 +1039,7 @@ __device__ float compute_best_rescale_parallel(
   //=========================================================================
   // Phase 1: Coarse grid search
   //=========================================================================
-  const int COARSE_SAMPLES = 64;  // Though not fully utilize each thread, but very fast
+  const int COARSE_SAMPLES = 32;  // Though not fully utilize each thread, but very fast
   float best_coarse_ip     = 0.0f;
   float best_coarse_t      = t_start;
 
@@ -1092,9 +1092,7 @@ __device__ float compute_best_rescale_parallel(
   float fine_start = fmaxf(t_start, center_t - range);
   float fine_end   = fminf(t_end, center_t + range);
 
-  // 64 samples (raised from 32) better matches v2.1/v2.2 accuracy while
-  // retaining the v2.3/v2.4 speedup.
-  const int FINE_SAMPLES = 64;
+  const int FINE_SAMPLES = 32;
   float best_fine_ip     = 0.0f;
   float best_fine_t      = center_t;
 
