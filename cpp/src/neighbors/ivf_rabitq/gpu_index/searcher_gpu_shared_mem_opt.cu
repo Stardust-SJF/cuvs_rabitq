@@ -203,16 +203,30 @@ __global__ void computeInnerProductsWithLUT16OptBlockSort(
   const ComputeInnerProductsKernelParams params)
 {
   const int block_id = blockIdx.x;
-  if (block_id >= params.num_pairs) return;
+  const bool split_large_cluster = params.split_range_size > 0;
+  const int pair_block_id =
+    split_large_cluster ? block_id / static_cast<int>(params.split_max_blocks_per_pair) : block_id;
+  const int split_id =
+    split_large_cluster ? block_id -
+                            pair_block_id * static_cast<int>(params.split_max_blocks_per_pair)
+                        : 0;
+  if (pair_block_id >= params.num_pairs) return;
 
-  ClusterQueryPair pair = params.d_sorted_pairs[block_id];
+  ClusterQueryPair pair = params.d_sorted_pairs[pair_block_id];
   int cluster_idx       = pair.cluster_idx;
   int query_idx         = pair.query_idx;
 
   if (cluster_idx >= params.num_centroids || query_idx >= params.num_queries) return;
 
-  size_t num_vectors_in_cluster = params.d_cluster_meta[cluster_idx].num;
-  size_t cluster_start_index    = params.d_cluster_meta[cluster_idx].start_index;
+  const size_t cluster_size        = params.d_cluster_meta[cluster_idx].num;
+  const size_t cluster_start_index = params.d_cluster_meta[cluster_idx].start_index;
+  const size_t range_start =
+    split_large_cluster ? static_cast<size_t>(split_id) * params.split_range_size : 0;
+  if (range_start >= cluster_size) return;
+  const size_t range_len =
+    split_large_cluster
+      ? min(static_cast<size_t>(params.split_range_size), cluster_size - range_start)
+      : cluster_size;
 
   const uint32_t num_chunks         = params.D / BITS_PER_CHUNK;
   const uint32_t lut_per_query_size = num_chunks * LUT_SIZE;
@@ -260,13 +274,14 @@ __global__ void computeInnerProductsWithLUT16OptBlockSort(
   const uint32_t short_code_length = params.D / 32;
   const uint32_t chunks_per_uint32 = 32 / BITS_PER_CHUNK;
 
-  for (size_t vec_base = 0; vec_base < num_vectors_in_cluster; vec_base += num_threads) {
-    size_t vec_idx = vec_base + tid;
+  for (size_t vec_base = 0; vec_base < range_len; vec_base += num_threads) {
+    size_t range_vec_idx = vec_base + tid;
+    size_t vec_idx       = range_start + range_vec_idx;
 
     float local_ip    = 0.0f;
     bool is_candidate = false;
 
-    if (vec_idx < num_vectors_in_cluster) {
+    if (range_vec_idx < range_len) {
       size_t factor_offset = cluster_start_index + vec_idx;
       float3 factors       = reinterpret_cast<const float3*>(params.d_short_factors)[factor_offset];
       float f_add          = factors.x;
@@ -275,7 +290,7 @@ __global__ void computeInnerProductsWithLUT16OptBlockSort(
       float ip = 0.0f;
       for (uint32_t uint32_idx = 0; uint32_idx < short_code_length; uint32_idx++) {
         size_t short_code_offset =
-          cluster_start_index * short_code_length + uint32_idx * num_vectors_in_cluster + vec_idx;
+          cluster_start_index * short_code_length + uint32_idx * cluster_size + vec_idx;
         uint32_t short_code_chunk = params.d_short_data[short_code_offset];
         for (int chunk_in_uint32 = 0; chunk_in_uint32 < chunks_per_uint32; chunk_in_uint32++) {
           int shift              = 28 - (chunk_in_uint32 * BITS_PER_CHUNK);
@@ -325,7 +340,7 @@ __global__ void computeInnerProductsWithLUT16OptBlockSort(
   if (candidate_count == 0 && params.pairs_query_major) {
     uint32_t output_offset =
       query_idx * (params.topk * params.output_slots_per_query) +
-      (block_id % static_cast<int>(params.nprobe)) * params.topk;
+      (pair_block_id % static_cast<int>(params.nprobe)) * params.topk;
     for (uint32_t i = tid; i < params.topk; i += num_threads) {
       params.d_topk_dists[output_offset + i] = INFINITY;
       params.d_topk_pids[output_offset + i]  = 0;
@@ -469,7 +484,7 @@ __global__ void computeInnerProductsWithLUT16OptBlockSort(
 
       if (tid == 0) {
         probe_slot = params.pairs_query_major
-                       ? (block_id % static_cast<int>(params.nprobe))
+                       ? (pair_block_id % static_cast<int>(params.nprobe))
                        : atomicAdd(&params.d_query_write_counters[query_idx], 1);
       }
       __syncthreads();
@@ -882,6 +897,12 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
                                        : dev_props.sharedMemPerBlock;
   // Leave headroom for static shared memory and CUDA's per-kernel accounting.
   if (max_dynamic_smem > 4096) { max_dynamic_smem -= 4096; }
+  size_t four_block_smem_target = max_dynamic_smem;
+  if (dev_props.sharedMemPerMultiprocessor > 0) {
+    size_t per_sm_four_block_budget = dev_props.sharedMemPerMultiprocessor / 4;
+    if (per_sm_four_block_budget > 4096) { per_sm_four_block_budget -= 4096; }
+    four_block_smem_target = min(four_block_smem_target, per_sm_four_block_budget);
+  }
 
   const bool with_ex        = cur_ivf.get_ex_bits() != 0;
   const size_t lut_per_query_bytes = lut_size / num_queries;
@@ -918,16 +939,32 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
     return lo;
   };
 
-  // LUT16 has a heavier per-block LUT/IP2 pipeline than quant4; in DEEP150M
-  // smoke tests, split scheduling was slower than the previous shared-memory
-  // capacity clamp. Keep the split scaffolding off until it can beat this path.
-  const size_t split_smem_target = max_dynamic_smem;
-  if (use_block_sort && split_smem_target > 0 &&
-      smem_for_capacity(max_candidates_per_pair) > split_smem_target) {
-    max_candidates_per_pair = find_largest_capacity(0, max_candidates_per_pair, split_smem_target);
-  }
   uint32_t split_range_size          = 0;
   uint32_t split_max_blocks_per_pair = 1;
+  if (use_block_sort && enable_dynamic_block && blockDim == kSearchKernelMinBlockDim &&
+      four_block_smem_target > 0) {
+    if (smem_for_capacity(max_cluster_size) > four_block_smem_target) {
+      uint32_t lo = static_cast<uint32_t>(topk);
+      uint32_t hi = max_cluster_size;
+      if (lo > hi) { lo = hi; }
+      if (smem_for_capacity(lo) <= four_block_smem_target) {
+        lo = find_largest_capacity(lo, hi, four_block_smem_target);
+        if (lo > 0 && lo < max_cluster_size) {
+          split_range_size          = lo;
+          split_max_blocks_per_pair = (max_cluster_size + split_range_size - 1) / split_range_size;
+          max_candidates_per_pair   = split_range_size;
+          size_t split_grid_dim     = num_pairs * split_max_blocks_per_pair;
+          RAFT_EXPECTS(split_grid_dim <= std::numeric_limits<uint32_t>::max(),
+                       "RaBitQ LUT16 split search kernel grid exceeds uint32_t range");
+          gridDim = static_cast<uint32_t>(split_grid_dim);
+        }
+      }
+    }
+  }
+  if (split_range_size == 0 && use_block_sort && max_dynamic_smem > 0 &&
+      smem_for_capacity(max_candidates_per_pair) > max_dynamic_smem) {
+    max_candidates_per_pair = find_largest_capacity(0, max_candidates_per_pair, max_dynamic_smem);
+  }
 
   const size_t output_slots_per_query =
     use_block_sort ? nprobe * split_max_blocks_per_pair : max_probed_vectors_count.value();
@@ -939,7 +976,8 @@ void SearcherGPU::SearchClusterQueryPairsSharedMemOpt(const IVFGPU& cur_ivf,
   d_topk_dists = raft::make_device_vector<float, int64_t>(handle_, total_elements);
   d_topk_pids  = raft::make_device_vector<PID, int64_t>(handle_, total_elements);
 
-  const bool kernel_pairs_query_major = use_block_sort && effective_pairs_query_major;
+  const bool kernel_pairs_query_major =
+    use_block_sort && effective_pairs_query_major && split_range_size == 0;
   if (!use_block_sort || !kernel_pairs_query_major || split_range_size != 0) {
     thrust::fill(thrust::cuda::par.on(stream_),
                  d_topk_dists.data_handle(),
