@@ -44,7 +44,7 @@ auto build(raft::resources const& handle,
   // Calculate dataset size and available workspace once
   size_t dataset_bytes             = sizeof(T) * n_rows * dim;
   size_t available_workspace       = raft::resource::get_workspace_free_bytes(handle);
-  constexpr size_t kTolerableRatio = 4;
+  constexpr double kTolerableRatio = 1.5;
 
   rmm::device_async_resource_ref device_memory = raft::resource::get_workspace_resource_ref(handle);
   // If the dataset is small enough to comfortably fit into device memory, put it there.
