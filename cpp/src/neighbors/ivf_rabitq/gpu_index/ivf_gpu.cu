@@ -1198,10 +1198,10 @@ void IVFGPU::quantize_cluster(GPUClusterMeta& cp,
 }
 
 // Custom centroid-IP kernel for the [N×D]·[D×K] gemv at small N (NQ=1 search).
-// At NQ=1 the cuBLASLt centroid-IP path dispatches `gemv2T_kernel_ref` (~30-45 µs
-// avg on L40S at K=4096, D=768) — a cuBLASLt heuristic miss we cannot redirect
-// from the API. This kernel processes each centroid row with one warp (32 lanes
-// split the D-dim dot product), and loads the query into shared once per block.
+// At small NQ the cuBLASLt centroid-IP path dispatches a slow gemv kernel that
+// we cannot redirect from the API. This kernel processes each centroid row with
+// one warp (32 lanes split the D-dim dot product), and loads the query into
+// shared once per block.
 //
 // Layout: queries [N×D] row-major; centroids [K×D] row-major (each centroid is
 // a contiguous D-float row); dist [N×K] row-major.
@@ -1523,25 +1523,12 @@ void IVFGPU::PrepareClusterSearchInputs(
   uint32_t min_sort_pairs,
   centroid_select_kind centroid_sel)
 {
-  // Step 1: Compute -2 * Q * C^T. At small batch_size (NQ=1 search) the cuBLASLt
-  // path dispatched the slow `gemv2T_kernel_ref` (~30-45 µs avg on L40S at
-  // K=4096, D=768); use a custom warp-per-row kernel below the crossover. cuBLAS
-  // keeps winning at large batch sizes (training / large-batch search).
-  const float alpha = -2.f;
-  // Crossover study (codesearchnet K=4096 D=768 on L40S, May 2026; 3-trial
-  // median, nprobe=100, end-to-end µs/query):
-  //   NQ=1  custom 198 / cuBLAS 222   custom -24    custom wins decisively
-  //   NQ=2  custom 116 / cuBLAS 105   cuBLAS -11    cuBLAS p50, but bimodal
-  //   NQ=4  custom  65 / cuBLAS  69   custom  -5    custom + stabler tail
-  //   NQ=8  custom  42 / cuBLAS  44   custom  -2    custom + stabler tail
-  //   NQ=10 custom  45 / cuBLAS  23   cuBLAS -22    cuBLAS clearly faster
-  //   NQ=16 custom  32 / cuBLAS  15   cuBLAS -17    cuBLAS clearly faster
-  // cuBLAS dispatches `gemv2T_kernel_ref` at NQ=1 (heuristic miss, ~40 µs/call)
-  // and `gemmSN_TN_kernel` at NQ≥2 (bimodal: median 27 µs, but sporadic 3 ms
-  // outliers from cuBLASLt heuristic re-search). Custom warp-per-row scales
-  // linearly but is rock-stable (<1% trial variance). At NQ≤8 they're close
-  // at p50; custom wins p99 thanks to stable latency. At NQ≥10 cuBLAS hits a
-  // regime change and wins by 2×.
+  // Step 1: Compute -2 * Q * C^T. At small batch_size cuBLASLt dispatches a slow
+  // gemv kernel (and the cuBLASLt SGEMM path it picks at NQ≥2 is bimodal —
+  // sporadic heuristic re-search outliers), so use the custom warp-per-row
+  // kernel below the crossover. cuBLAS wins at large batch sizes (training /
+  // large-batch search) where it leaves the gemv regime.
+  const float alpha                  = -2.f;
   constexpr size_t kSmallBatchCutoff = 8;
   if (batch_size <= kSmallBatchCutoff && num_padded_dim % 32 == 0) {
     constexpr int kBlockSize      = 256;
@@ -1563,9 +1550,8 @@ void IVFGPU::PrepareClusterSearchInputs(
     const float beta = 0.f;
     // Use raft::linalg::gemm (legacy cuBLAS path, same as IVF-PQ's
     // select_clusters) instead of detail::matmul (cuBLASLt). cuBLASLt's
-    // gemmSN_TN_kernel is bimodal at NQ≥2 (median ~27 µs but 3 ms outliers
-    // from heuristic re-search); legacy cublasSgemm dispatches a stabler
-    // kernel family at the same shape (M=NQ, N=K=4096, K=D=768).
+    // SGEMM path is bimodal at small NQ due to heuristic re-search; legacy
+    // cublasSgemm dispatches a stabler kernel family at this shape.
     raft::linalg::gemm(handle_,
                        /* trans_a = */ true,
                        /* trans_b = */ false,
@@ -1611,15 +1597,9 @@ void IVFGPU::PrepareClusterSearchInputs(
 
   // Step 4: select top-nprobe clusters per query.
   //
-  // Algorithm choice: defer to raft's kAuto for the production default. A
-  // diagnostic sweep (kauto / warp_distributed_shm / radix11bits across
-  // nprobe ∈ [64, 400] on wiki_all bs=1000) showed all three variants
-  // produce within-noise QPS at every nprobe — the choice of select_k
-  // algorithm is essentially neutral at our typical shape. The 2-3× cliff
-  // observed at nprobe ≈ 250 is rooted elsewhere (the skip-sort threshold
-  // boundary, not select_k).
-  //
-  // The forced-algorithm enum values are retained for ablation only.
+  // Defer to raft's kAuto by default — the choice of select_k algorithm is
+  // essentially neutral at our typical shape. The forced-algorithm enum
+  // values are retained for ablation only.
   raft::matrix::SelectAlgo select_algo;
   switch (centroid_sel) {
     case centroid_select_kind::warp_distributed_shm:

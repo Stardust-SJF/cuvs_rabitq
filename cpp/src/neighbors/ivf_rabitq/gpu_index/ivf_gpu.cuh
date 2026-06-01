@@ -422,8 +422,7 @@ class IVFGPU {
   // vector per cluster — typically the cluster's first member rotated by R.
   // Used by seed_threshold_from_representative_kernel for a provably-correct
   // upper bound on the K-th-best distance: max(d(q, rep_i) for top-K nearest
-  // clusters) ≥ true K-th best, regardless of cluster geometry (works on
-  // gist/openai/etc where centroid×scale heuristic fails).
+  // clusters) ≥ true K-th best, regardless of cluster geometry.
   raft::device_vector<float, int64_t> representatives_ =
     raft::make_device_vector<float, int64_t>(handle_, 0);
 

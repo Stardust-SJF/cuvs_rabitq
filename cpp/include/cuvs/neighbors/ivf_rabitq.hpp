@@ -159,13 +159,9 @@ enum class threshold_strategy : uint8_t {
  * Algorithm used by the centroid-distance top-K (`raft::matrix::select_k`
  * call that picks the `n_probes` nearest clusters per query).
  *
- * Production default `auto_policy` defers to raft's `kAuto` heuristic. A
- * diagnostic sweep across {kauto, warp_distributed_shm, radix11bits} on
- * wiki_all (n_lists=40000, batch=1000) showed all three within ±2% kQPS at
- * every `n_probes ∈ [64, 400]`. The choice is essentially neutral at our
- * shape, so we let raft pick.
- *
- * The forced-algorithm values are retained for ablation only.
+ * The default `auto_policy` defers to raft's `kAuto` heuristic; the choice
+ * is essentially neutral at our typical shape. The forced-algorithm values
+ * are retained for ablation only.
  */
 enum class centroid_select_kind : uint8_t {
   /** Defer to `raft::matrix::SelectAlgo::kAuto`. Production default. */
@@ -186,9 +182,8 @@ struct search_params : cuvs::neighbors::search_params {
   search_mode mode = search_mode::QUANT4;
   /** Threshold-seeding strategy. See `threshold_strategy`. */
   threshold_strategy strategy = threshold_strategy::centroid_reorder;
-  /** Scale factor for the CENTROID_REORDER seed threshold. Production default
-   *  is 1.45 (per upstream sweep across multiple datasets). Ignored when
-   *  `strategy == none`. */
+  /** Scale factor for the CENTROID_REORDER seed threshold. Default 1.45.
+   *  Ignored when `strategy == none`. */
   float centroid_reorder_scale = 1.45f;
   /** Number of nearest clusters per query that the CENTROID_REORDER pipeline
    *  promotes to a warmup pass, so they fire before the rest of the pairs
@@ -214,14 +209,8 @@ struct search_params : cuvs::neighbors::search_params {
    *  At small pair counts the sort overhead exceeds the reuse benefit and
    *  the simpler query-major fused build is faster.
    *
-   *  Production default is 2000 — picked from an L40S sweep across
-   *  {wiki_all, gist, imagenet, openai_1536_5M} × bs ∈ {1, 10, 100, 1000}
-   *  × nprobe ∈ {1, 5, 10, 50, 100, 200}. The crossover landed near
-   *  num_pairs ≈ 2000:
-   *    num_pairs <  200 : skip-sort wins +4.9% avg
-   *    num_pairs <  1k  : skip-sort wins +3.4% avg
-   *    num_pairs 1k-2k  : skip-sort still mostly wins (per-row median +2% at NQ=10)
-   *    num_pairs ≥ 2k   : sort wins (7-14% at NQ=10 on wiki/gist; up to 25% at higher NQ)
+   *  Default 2000, picked around the empirical crossover where the L2-reuse
+   *  benefit of sorting begins to outweigh the sort overhead.
    *
    *  Independently of this threshold, the sort is always skipped when
    *  `num_queries == 1` — at NQ=1 each cluster is visited at most once so

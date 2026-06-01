@@ -98,8 +98,6 @@ __global__ inline void build_query_major_pairs_kernel(const int* d_raft_idx,
 
 // Floor below which the search kernel's tuned shared-memory layout, MAX_TOP_K
 // warpsort, and candidate-scan grid-stride loop assumptions degrade.
-// Empirically (GBitQ bench_dynblock_coresidency.csv) shrinking below 256 caused
-// 30-70% QPS regressions at NQ >= 100.
 static constexpr uint32_t kSearchKernelMinBlockDim = 256;
 
 // Choose a search-kernel blockDim based on device occupancy and total work.
@@ -148,11 +146,10 @@ static inline uint32_t compute_dynamic_block_dim(size_t num_queries,
   // for the ex-code re-rank stage's warp-per-candidate parallelism.
   //
   // The underutilization check is critical: at large batch_size the grid is
-  // already huge (~100k blocks across ~142 SMs), and bumping blockDim from
+  // already large enough to saturate the device, and bumping blockDim from
   // 256 → 512 only reduces per-SM occupancy without finding any idle warps
-  // to recruit. Empirically this caused a 10% perf cliff at np=10 vs np=12
-  // on openai_1536_5M / bs=10000 / quant4 / bits_per_dim=8 (where the
-  // kernel is shmem-heavy, so larger blocks drop occupancy hard).
+  // to recruit — the search kernel is shmem-heavy, so larger blocks drop
+  // occupancy hard.
   const size_t nprobe = (num_queries > 0) ? (num_pairs / num_queries) : 0;
   const size_t device_thread_capacity =
     static_cast<size_t>(dev_props.multiProcessorCount) * dev_props.maxThreadsPerMultiProcessor;
