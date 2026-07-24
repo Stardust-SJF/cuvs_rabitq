@@ -110,6 +110,7 @@ __global__ void exrabitq_quantize_query(
 
   // only thread 0 in the block needs the results, so simply use blockReduceSum
   ip_resi_xucb = blockReduceSum(ip_resi_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   xu_sq        = blockReduceSum(xu_sq);
 
   // Thread 0 computes and writes the final factors

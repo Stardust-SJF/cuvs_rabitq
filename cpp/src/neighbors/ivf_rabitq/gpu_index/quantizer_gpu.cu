@@ -265,8 +265,11 @@ __global__ void pack_and_compute_factors_kernel(
 
   // Perform parallel reduction within the block
   l2_sqr       = blockReduceSum(l2_sqr);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   ip_resi_xucb = blockReduceSum(ip_resi_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   ip_cent_xucb = blockReduceSum(ip_cent_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   xu_sq        = blockReduceSum(xu_sq);
 
   // Thread 0 performs the final calculations and writes the factors
@@ -401,10 +404,15 @@ __global__ void exrabitq_fused_kernel_batch(
     xu_sq += xu * xu;
   }
 
+  // guard shared-scratch reuse from the earlier ip_norm reduction
+  __syncthreads();
   // Perform parallel reductions for all factor components
   l2_sqr       = blockReduceSum(l2_sqr);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   ip_resi_xucb = blockReduceSum(ip_resi_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   ip_cent_xucb = blockReduceSum(ip_cent_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   xu_sq        = blockReduceSum(xu_sq);
 
   // Thread 0 computes and writes the final factors
@@ -1145,10 +1153,15 @@ __global__ void exrabitq_fused_kernel_batch_ori(
     xu_sq += xu * xu;
   }
 
+  // guard shared-scratch reuse from the earlier ip_norm reduction
+  __syncthreads();
   // Perform parallel reductions for all factor components
   l2_sqr       = blockReduceSum(l2_sqr);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   ip_resi_xucb = blockReduceSum(ip_resi_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   ip_cent_xucb = blockReduceSum(ip_cent_xucb);
+  __syncthreads();  // guard shared-scratch reuse between reductions
   xu_sq        = blockReduceSum(xu_sq);
 
   // Thread 0 computes and writes the final factors
